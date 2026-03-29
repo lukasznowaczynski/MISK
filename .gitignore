@@ -1,0 +1,24 @@
+# --- Python ---
+# Ignorujemy całe środowisko wirtualne (najważniejsze!)
+venv/
+ENV/
+env/
+
+# Ignorujemy pliki skompilowane (tworzone automatycznie przez Pythona)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- IDE i Systemowe ---
+# Jeśli używasz VS Code lub PyCharm
+.vscode/
+.idea/
+# Pliki systemowe Windows/Mac
+Thumbs.db
+.DS_Store
+
+# --- CoppeliaSim ---
+# Pliki tymczasowe i logi symulacji
+remoteApiConnections.txt
+*.bak
+*.log
