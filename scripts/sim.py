@@ -38,7 +38,7 @@ else:
 # --- KONFIGURACJA ---
 # Łaziki
 n_rovers = 7             # Ile łazików zespawnować
-distance_step = 5 
+distance_step = 7
 rover_z_height = 1.5
 rover_ori_deg = [0, 0, -90]
 
@@ -57,9 +57,6 @@ plant_start_y = 0        # Start pola uprawnego (Y)
 
 rover_ori_rad = [math.radians(x) for x in rover_ori_deg]
 
-
-
-# 1. Przygotowanie pozycji i nazw dla łazików
 rover_positions = []
 rover_names = []
 
