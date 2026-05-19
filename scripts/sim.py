@@ -5,23 +5,21 @@ client = RemoteAPIClient()
 sim = client.getObject('sim')
 
 a_pwd = os.getcwd()
-model_path = a_pwd + "/models/rover.ttm"
+model_path = a_pwd + "/models/rover2.ttm"
 print(model_path)
 
 positions = [
     [-2.0,  2.0, 0.4],
-    [ 2.0,  2.0, 0.4],
-    [-2.0, -2.0, 0.4],
-    [ 2.0, -2.0, 0.4]
+
 ]
 
-names = ["rover_1", "rover_2", "rover_3", "rover_4"]
+names = ["rover_1"]
 
 base_handle = sim.loadModel(model_path)
 handles = [base_handle]
 
 # Copy models
-for _ in range(3):
+for _ in range(1):
     copy = sim.copyPasteObjects([base_handle], 1)
     handles.append(copy[0])
 
