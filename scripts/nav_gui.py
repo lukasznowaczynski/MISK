@@ -5,13 +5,205 @@ import tkinter as tk
 from tkinter import ttk
 import math
 
+import cv2
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from Rover import Rover
 from Plant import Plant
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
-client = RemoteAPIClient()
-sim = client.getObject('sim')
+# Assigned in setup_environment() before any detect_* call
+client = None
+sim    = None
+
+
+# ── Environment setup ──────────────────────────────────────────────────────
+
+def setup_environment():
+    _client = RemoteAPIClient()
+    _sim    = _client.getObject('sim')
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir   = os.path.dirname(script_dir)
+
+    rover_path  = os.path.join(base_dir, "models", "rover2.ttm")
+    wiatka_path = os.path.join(base_dir, "models", "big_wiatka.ttm")
+    # prefer plant1.ttm (has aruco_plane); fall back to plant.ttm
+    plant_path = os.path.join(base_dir, "models", "plant1.ttm")
+    if not os.path.exists(plant_path):
+        plant_path = os.path.join(base_dir, "models", "plant.ttm")
+
+    # ── Stop and wait ──────────────────────────────────────────────────────
+    _sim.stopSimulation()
+    while _sim.getSimulationState() != _sim.simulation_stopped:
+        time.sleep(0.1)
+
+    # ── Clean slate: remove all managed objects by prefix ─────────────────
+    # (same approach as test_rover.py — removeModel first to clear full tree)
+    CLEANUP = ('rover', 'base_cube', 'charging_station', 'ground_plane',
+               'plant_', 'big_wiatka', 'terrain')
+    for obj in _sim.getObjectsInTree(_sim.handle_scene, _sim.handle_all, 1):
+        if _sim.getObjectParent(obj) != -1:
+            continue
+        alias = _sim.getObjectAlias(obj, 0)
+        if any(alias.startswith(p) for p in CLEANUP):
+            try:
+                _sim.removeModel(obj)
+            except Exception:
+                try:
+                    _sim.removeObject(obj)
+                except Exception:
+                    pass
+
+    # ── Layout constants ───────────────────────────────────────────────────
+    N_ROVERS      = 7
+    DISTANCE_STEP = 7
+    WIATKA_X      = 10.0
+    WIATKA_Y      = -30.0
+    SAFE_MARGIN   = 20
+
+    # Charging stations in a 2×2 grid under the bower
+    CHARGING_STATIONS = {
+        1: (WIATKA_X - 1.5, WIATKA_Y + 1.5, 0.04),
+        2: (WIATKA_X + 1.5, WIATKA_Y + 1.5, 0.04),
+        3: (WIATKA_X - 1.5, WIATKA_Y - 1.5, 0.04),
+        4: (WIATKA_X + 1.5, WIATKA_Y - 1.5, 0.04),
+    }
+
+    half = N_ROVERS // 2
+    rover_positions = []
+    for i in range(N_ROVERS):
+        x = (WIATKA_X - (half - i - 1) * DISTANCE_STEP - SAFE_MARGIN
+             if i < half
+             else WIATKA_X + (i - half) * DISTANCE_STEP + SAFE_MARGIN)
+        rover_positions.append([x, -30.0, 2.0])   # z=2.0 clears any terrain bumps
+    rover_names = [f"rover_{i+1}" for i in range(N_ROVERS)]
+
+    ARM_JOINTS = ['arm_base_joint', 'shoulder_joint', 'elbow_joint',
+                  'wrist_joint', 'gripper_left_joint', 'gripper_right_joint']
+
+    PLANTS_M, PLANTS_N = 5, 4
+    plant_positions, plant_names = [], []
+    for m in range(PLANTS_M):
+        for n in range(PLANTS_N):
+            plant_positions.append([-30 + m * 20, 0 + n * 20, 2.0])
+            plant_names.append(f"plant_{m}_{n}")
+
+    # ── Uneven terrain (heightfield) ───────────────────────────────────────
+    PTS         = 64
+    TERRAIN_SZ  = 200.0
+    heights = []
+    for yi in range(PTS):
+        for xi in range(PTS):
+            fx = xi / (PTS - 1) * 8 * math.pi
+            fy = yi / (PTS - 1) * 6 * math.pi
+            h = (math.sin(fx * 0.5) * math.cos(fy * 0.4) * 0.30 +
+                 math.sin(fx * 1.3 + 0.7) * math.sin(fy * 1.1) * 0.15 +
+                 math.cos(fx * 2.5) * math.sin(fy * 2.0 + 1.2) * 0.10)
+            heights.append(h)   # ±0.55 m variation
+
+    terrain_h = _sim.createHeightfieldShape(0, 40, PTS, PTS, TERRAIN_SZ, heights)
+    _sim.setObjectPosition(terrain_h, -1, [0, 0, 0])
+    _sim.setObjectAlias(terrain_h, 'ground_plane')
+    _sim.setShapeColor(terrain_h, None,
+                       _sim.colorcomponent_ambient_diffuse, [0.45, 0.30, 0.22])
+    _sim.setObjectInt32Param(terrain_h, _sim.shapeintparam_static, 1)
+    _sim.setObjectInt32Param(terrain_h, _sim.shapeintparam_respondable, 1)
+    print("Stworzono teren")
+
+    # ── Charging station pads ──────────────────────────────────────────────
+    for sid, (x, y, z) in CHARGING_STATIONS.items():
+        pad = _sim.createPrimitiveShape(
+            _sim.primitiveshape_cylinder, [1.0, 1.0, 0.08], 0)
+        _sim.setObjectPosition(pad, -1, [x, y, 0.04])
+        _sim.setObjectAlias(pad, f'charging_station_{sid}')
+        _sim.setShapeColor(pad, None, _sim.colorcomponent_ambient_diffuse, [1.0, 0.75, 0.0])
+        _sim.setObjectInt32Param(pad, _sim.shapeintparam_static, 1)
+        _sim.setObjectInt32Param(pad, _sim.shapeintparam_respondable, 0)
+
+    # ── Rovers ────────────────────────────────────────────────────────────
+    rover_jmaps = {}
+    if os.path.exists(rover_path):
+        base_rv = _sim.loadModel(rover_path)
+        rv_handles = [base_rv]
+        for _ in range(N_ROVERS - 1):
+            rv_handles.append(_sim.copyPasteObjects([base_rv], 1)[0])
+        for h, pos, name in zip(rv_handles, rover_positions, rover_names):
+            _sim.setObjectPosition(h, -1, pos)
+            _sim.setObjectOrientation(h, -1, [0, 0, math.radians(90)])
+            _sim.setObjectAlias(h, name)
+            joints = _sim.getObjectsInTree(h, _sim.object_joint_type, 0)
+            rover_jmaps[name] = {_sim.getObjectAlias(j, 0): j for j in joints}
+        print(f"Spawned {N_ROVERS} rovers")
+    else:
+        print(f"BLAD: brak {rover_path}")
+
+    # ── Wiatka (shelter) ──────────────────────────────────────────────────
+    if os.path.exists(wiatka_path):
+        wh = _sim.loadModel(wiatka_path)
+        _sim.setObjectPosition(wh, -1, [WIATKA_X, WIATKA_Y, 5.0])
+        _sim.setObjectAlias(wh, 'big_wiatka_1')
+        print("Spawned big_wiatka_1")
+
+    # ── Plants with ArUco markers ──────────────────────────────────────────
+    if os.path.exists(plant_path):
+        base_ph   = _sim.loadModel(plant_path)
+        p_handles = [base_ph]
+        for _ in range(len(plant_positions) - 1):
+            p_handles.append(_sim.copyPasteObjects([base_ph], 1)[0])
+
+        use_aruco = 'plant1' in os.path.basename(plant_path)
+        if use_aruco:
+            try:
+                aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
+            except AttributeError:
+                aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_5X5_100)
+
+        print(f"Generowanie {len(plant_positions)} roslin...")
+        for i, (h, pos, name) in enumerate(zip(p_handles, plant_positions, plant_names)):
+            _sim.setObjectPosition(h, -1, pos)
+            _sim.setObjectOrientation(h, -1, [0, 0, math.radians(-90)])
+            _sim.setObjectAlias(h, name)
+            if use_aruco:
+                try:
+                    plane_h     = _sim.getObject('./aruco_plane', {'proxy': h})
+                    tex_res     = 512
+                    marker_size = 392
+                    visual_id   = i + 10
+                    try:
+                        marker = cv2.aruco.generateImageMarker(aruco_dict, visual_id, marker_size)
+                    except AttributeError:
+                        marker = cv2.aruco.drawMarker(aruco_dict, visual_id, marker_size)
+                    img = np.ones((tex_res, tex_res), dtype=np.uint8) * 255
+                    off = (tex_res - marker_size) // 2
+                    img[off:off+marker_size, off:off+marker_size] = marker
+                    rgb = cv2.flip(cv2.cvtColor(img, cv2.COLOR_GRAY2RGB), 0)
+                    tmp, tid, _ = _sim.createTexture(
+                        "", 0, [0.15, 0.15], [1, 1], [0, 0, 0], 1, [tex_res, tex_res])
+                    _sim.setShapeTexture(plane_h, tid, 0, 0, [0.3, 0.3])
+                    _sim.removeObject(tmp)
+                    _sim.writeTexture(tid, 0, rgb.tobytes(), 0, 0, tex_res, tex_res)
+                    _sim.setObjectSizeValues(plane_h, [0.3, 0.3, 0.001])
+                    print(f"  {name} aruco id={visual_id}")
+                except Exception as e:
+                    print(f"  ArUco {name}: {e}")
+    else:
+        print(f"BLAD: brak modelu rosliny: {plant_path}")
+
+    # ── Start simulation ───────────────────────────────────────────────────
+    _sim.startSimulation()
+    time.sleep(1.0)
+
+    # Reset arm joints (like test_rover.py) so the arm doesn't flail
+    for name, jmap in rover_jmaps.items():
+        for jname in ARM_JOINTS:
+            if jname in jmap:
+                _sim.setJointMode(jmap[jname], _sim.jointmode_force, 0)
+                _sim.setJointTargetPosition(jmap[jname], 0)
+    time.sleep(0.5)
+
+    return _client, _sim
 
 # ── Scene discovery — direct alias lookups (no full-scene scan) ────────────
 
@@ -721,9 +913,9 @@ class NavApp:
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
-if sim.getSimulationState() == sim.simulation_stopped:
-    print("UWAGA: symulacja nie jest uruchomiona. Uruchom najpierw test_rover.py.")
-else:
+if __name__ == "__main__":
+    client, sim = setup_environment()
+
     base_pos = detect_base()
     stations = detect_charging_stations()
     if not stations:
@@ -731,7 +923,7 @@ else:
 
     rovers = detect_rovers(stations, base_pos=base_pos)
     if not rovers:
-        print("Nie znaleziono roverow. Uruchom najpierw test_rover.py.")
+        print("Nie znaleziono roverow.")
     else:
         print(f"Znaleziono {len(rovers)} rover(ow): {[r.name for r in rovers]}")
         if base_pos:
