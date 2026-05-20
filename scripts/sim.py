@@ -14,13 +14,14 @@ base_dir = os.path.dirname(script_dir)
 
 # Ścieżki do modeli i sceny
 scene_path = os.path.join(base_dir, "scenes", "powierzchnia_marsa.ttt") 
-rover_path = os.path.join(base_dir, "models", "rover.ttm")
+rover_path = os.path.join(base_dir, "models", "rover2.ttm")
 plant_path = os.path.join(base_dir, "models", "plant.ttm")
 wiatka_path = os.path.join(base_dir, "models", "big_wiatka.ttm")
 
 # --- RESTART SCENY ---
 sim.stopSimulation()
-time.sleep(0.5) 
+while sim.getSimulationState() != sim.simulation_stopped:
+    time.sleep(0.1)
 
 if os.path.exists(scene_path):
     sim.loadScene(scene_path)
@@ -28,8 +29,34 @@ if os.path.exists(scene_path):
 else:
     print(f"BŁĄD: Nie znaleziono pliku sceny!")
 
+# Usuń obiekty które mogły być zapisane w pliku sceny
+SPAWN_PREFIXES = ('rover', 'plant_', 'big_wiatka')
+all_objects = sim.getObjectsInTree(sim.handle_scene, sim.handle_all, 1)
+to_remove = []
+for obj in all_objects:
+    if sim.getObjectParent(obj) != -1:
+        continue  # tylko root-level
+    alias = sim.getObjectAlias(obj, 0)
+    if any(alias.startswith(p) for p in SPAWN_PREFIXES):
+        to_remove.append((obj, alias))
+for obj, alias in to_remove:
+    sim.removeModel(obj)
+    print(f"Usunięto istniejący obiekt: {alias}")
+
+# Duży płaski teren 500x500m
+for obj in sim.getObjectsInTree(sim.handle_scene, sim.handle_all, 1):
+    if sim.getObjectParent(obj) == -1 and sim.getObjectAlias(obj, 0) == 'ground_plane':
+        sim.removeObject(obj)
+
+ground = sim.createPrimitiveShape(sim.primitiveshape_plane, [500, 500, 0], 0)
+sim.setObjectPosition(ground, -1, [0, 0, 0])
+sim.setObjectAlias(ground, 'ground_plane')
+sim.setShapeColor(ground, None, sim.colorcomponent_ambient_diffuse, [0.3, 0.25, 0.2])
+sim.setObjectInt32Param(ground, sim.shapeintparam_static, 1)
+sim.setObjectInt32Param(ground, sim.shapeintparam_respondable, 1)
+
 # --- KONFIGURACJA ---
-n_rovers = 11
+n_rovers = 10
 distance_step = 7
 rover_z_height = 1.5
 rover_ori_deg = [0, 0, -90]
@@ -106,3 +133,51 @@ if os.path.exists(plant_path):
 
 # Start symulacji
 sim.startSimulation()
+time.sleep(0.5)  # poczekaj aż skrypty Lua się zainicjalizują
+
+# --- STEROWANIE ŁAZIKÓW ---
+
+class RoverController:
+    def __init__(self, sim, name):
+        self.sim = sim
+        self.name = name
+
+    def set_velocity(self, left_vel, right_vel):
+        self.sim.setFloatSignal(self.name + '_lv', left_vel)
+        self.sim.setFloatSignal(self.name + '_rv', right_vel)
+
+    def forward(self, speed=2.0):
+        self.set_velocity(speed, speed)
+
+    def backward(self, speed=2.0):
+        self.set_velocity(-speed, -speed)
+
+    def turn_left(self, speed=1.5):
+        self.set_velocity(-speed, speed)
+
+    def turn_right(self, speed=1.5):
+        self.set_velocity(speed, -speed)
+
+    def stop(self):
+        self.set_velocity(0, 0)
+
+controllers = [RoverController(sim, name) for name in rover_names]
+
+# Przykład: jedź do przodu 3s, obróć się, jedź dalej
+for ctrl in controllers:
+    ctrl.forward(speed=2.0)
+
+time.sleep(3)
+
+for ctrl in controllers:
+    ctrl.turn_right(speed=1.5)
+
+time.sleep(1.5)
+
+for ctrl in controllers:
+    ctrl.forward(speed=2.0)
+
+time.sleep(3)
+
+for ctrl in controllers:
+    ctrl.stop()
