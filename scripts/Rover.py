@@ -27,7 +27,7 @@ class Rover:
     SOLAR_CHARGE_RATE   = 0.10   # panels open, not at station
 
     # Navigation
-    ARRIVE_DIST    = 0.8
+    ARRIVE_DIST    = 0.4
     HEADING_THRESH = 0.05
     MAX_SPEED      = 10.0
     MAX_TURN       = 6.0
@@ -114,6 +114,61 @@ class Rover:
             daemon=True,
         )
         self._thread.start()
+
+        with Rover._class_lock:
+
+            # create vision sensor
+            cam = self.sim.createVisionSensor(
+                0,
+                [256, 256, 0, 0],
+                [
+                    0.01,                 # near clipping
+                    20.0,                 # far clipping
+                    math.radians(100),     # FOV
+                    0.1,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ]
+            )
+
+            # name
+            self.sim.setObjectAlias(cam, f"{self.name}_camera")
+
+            # attach to rover
+            self.sim.setObjectParent(cam, self.handle, True)
+
+            # position relative to rover
+            self.sim.setObjectPosition(
+                cam,
+                self.handle,
+                [0.75, 0.0, 0.15]
+            )
+
+            # orientation relative to rover
+            self.sim.setObjectOrientation(
+                cam,
+                self.handle,
+                [0.0, math.pi / 2, math.pi / 2]
+            )
+
+            self.camera = cam
+
+        # with Rover._class_lock:
+        #     try:
+        #         # Szukamy kamery po jej absolutnej ścieżce widocznej na Twoim screenie.
+        #         # Np. dla rover_1 to będzie "/rover_1/VisionSensor"
+        #         sensor_path = f"/{self.name}/visionSensor"
+        #         self.camera = self.sim.getObject(sensor_path)
+                
+        #         print(f"[ROVER INIT] Sukces! Podpięto się pod gotowy obiektyw: {sensor_path}")
+        #     except Exception as e:
+        #         print(f"[ROVER INIT ERROR] Nie znaleziono 'VisionSensor' dla {self.name}: {e}")
+        #         self.camera = None
 
     # ── Setup ──────────────────────────────────────────────────────────────
 

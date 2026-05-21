@@ -4,6 +4,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 import math
+import subprocess
 
 import cv2
 import numpy as np
@@ -17,27 +18,67 @@ from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 client = None
 sim    = None
 
+# ── Automatyczne narzędzia sieciowe dla WSL ──────────────────────────────────
+def get_windows_ip():
+    """Automatycznie pobiera IP Windowsa (bramy domyślnej) z poziomu WSL."""
+    try:
+        cmd = "ip route | grep default | awk '{print $3}'"
+        ip = subprocess.check_output(cmd, shell=True).decode().strip()
+        if ip:
+            print(f"[WSL] Wykryto IP Windowsa: {ip}")
+            return ip
+    except Exception as e:
+        print(f"[WSL] Problem z automatycznym wykrywaniem IP: {e}")
+    print("[WSL] Nie udało się wykryć IP. Próba połączenia z localhost...")
+    return "127.0.0.1"
+
+def to_windows_path(wsl_path):
+    """Konwertuje ścieżkę z WSL na format sieciowy Windows za pomocą systemowego wslpath."""
+    try:
+        # Wymuszamy na systemie Windows podanie idealnej dla niego ścieżki sieciowej
+        win_path = subprocess.check_output(["wslpath", "-w", wsl_path]).decode().strip()
+        print(f"[WSL -> Windows] Przetłumaczono ścieżkę: {win_path}")
+        return win_path
+    except Exception as e:
+        # Awaryjny fallback na wypadek błędu subprocess
+        wsl_distro = os.environ.get("WSL_DISTRO_NAME", "Ubuntu")
+        cleaned_path = wsl_path.replace("/", "\\")
+        return f"\\\\wsl$\\{wsl_distro}{cleaned_path}"
 
 # ── Environment setup ──────────────────────────────────────────────────────
 
 def setup_environment():
-    _client = RemoteAPIClient()
+    win_ip = get_windows_ip()
+
+    #if on WSL
+    _client = RemoteAPIClient(host=win_ip, port=23000)
+
+    #if on Linux
+    # _client = RemoteAPIClient()
+
     _sim    = _client.getObject('sim')
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     base_dir   = os.path.dirname(script_dir)
 
-    rover_path  = os.path.join(base_dir, "models", "rover2.ttm")
-    wiatka_path = os.path.join(base_dir, "models", "big_wiatka.ttm")
+    rover_path_wsl  = os.path.join(base_dir, "models", "rover2.ttm")
+    wiatka_path_wsl = os.path.join(base_dir, "models", "big_wiatka.ttm")
     # prefer plant1.ttm (has aruco_plane); fall back to plant.ttm
-    plant_path = os.path.join(base_dir, "models", "plant1.ttm")
-    if not os.path.exists(plant_path):
-        plant_path = os.path.join(base_dir, "models", "plant.ttm")
+    plant_path_wsl = os.path.join(base_dir, "models", "plant1.ttm")
+    if not os.path.exists(plant_path_wsl):
+        plant_path_wsl = os.path.join(base_dir, "models", "plant.ttm")
+
+    #if on WSL
+    rover_path = subprocess.check_output(["wslpath", "-w", rover_path_wsl]).decode().strip()
+    plant_path = subprocess.check_output(["wslpath", "-w", plant_path_wsl]).decode().strip()
+    wiatka_path = subprocess.check_output(["wslpath", "-w", wiatka_path_wsl]).decode().strip()
 
     # ── Stop and wait ──────────────────────────────────────────────────────
     _sim.stopSimulation()
     while _sim.getSimulationState() != _sim.simulation_stopped:
         time.sleep(0.1)
+
+    
 
     # ── Clean slate: remove all managed objects by prefix ─────────────────
     # (same approach as test_rover.py — removeModel first to clear full tree)
@@ -124,7 +165,7 @@ def setup_environment():
 
     # ── Rovers ────────────────────────────────────────────────────────────
     rover_jmaps = {}
-    if os.path.exists(rover_path):
+    if os.path.exists(rover_path_wsl):
         base_rv = _sim.loadModel(rover_path)
         rv_handles = [base_rv]
         for _ in range(N_ROVERS - 1):
@@ -140,14 +181,14 @@ def setup_environment():
         print(f"BLAD: brak {rover_path}")
 
     # ── Wiatka (shelter) ──────────────────────────────────────────────────
-    if os.path.exists(wiatka_path):
+    if os.path.exists(wiatka_path_wsl):
         wh = _sim.loadModel(wiatka_path)
         _sim.setObjectPosition(wh, -1, [WIATKA_X, WIATKA_Y, 5.0])
         _sim.setObjectAlias(wh, 'big_wiatka_1')
         print("Spawned big_wiatka_1")
 
     # ── Plants with ArUco markers ──────────────────────────────────────────
-    if os.path.exists(plant_path):
+    if os.path.exists(plant_path_wsl):
         base_ph   = _sim.loadModel(plant_path)
         p_handles = [base_ph]
         for _ in range(len(plant_positions) - 1):
@@ -329,6 +370,8 @@ class NavApp:
         # plant_scan[name] = {state, received, vals(temp), display(persistent)}
         self._plant_scan = {}
 
+        self.emergency_map = {}
+
         self._view              = list(DEFAULT_VIEW)
         self.rover_target_items = {}
 
@@ -381,6 +424,259 @@ class NavApp:
         self._draw_grid()
         self._draw_base_and_stations()
         self._draw_plant_dots()
+
+    # ── RECOVERY ────────────────────────────────────────────────   
+    def recovery_mode(self):
+        print("\n" + "=" * 60)
+        print("[SYSTEM] URUCHAMIANIE PROCEDURY RECOVERY Z POZIOMU GUI")
+        print("=" * 60)
+
+        # 1. Odczyt i zabezpieczenie pozycji roślin w terminalu
+        print("\n[KROK 1] Odczytywanie i zabezpieczanie pozycji roślin przed awarią:")
+        print("-" * 50)
+        for plant in self.plants:
+            print(f"Roslina: {plant.name} -> Rzeczywiste Globalne X: {plant.pos[0]:.2f}, Y: {plant.pos[1]:.2f}")
+        print("-" * 50)
+        print(f"[SUKCES] Zabezpieczono dane {len(self.plants)} roślin.")
+
+        # 2. Informacja o wejściu w tryb amnezji
+        print("\n[KROK 2] Czyszczenie bazy mapowania... Symulacja amnezji floty.")
+        print("[OK] Centralna mapa została wyczyszczona. Brak danych wejściowych.")
+
+        # 3. Rozkaz fizycznej jazdy do bazy wraz z końcowym pozycjonowaniem i obrotem
+        print("\n[KROK 3] Nakaz fizycznego powrotu do baz stacji dokujących dla wszystkich łazików...")
+        print("-" * 50)
+        
+        for rv in self.rovers:
+            print(f" -> [{rv.name}]: Zamykanie paneli i powrót na stację z obrotem końcowym.")
+            
+            if getattr(rv, 'panels_open', False):
+                rv.close_panels()
+            
+            rv.go_to_base()
+
+        print("-" * 50)
+        print("[SYSTEM] Wszystkie łaziki zmierzają do wiatki.")
+        print("[SYSTEM] Uruchamianie automatycznego monitora parkowania floty...")
+        
+        # ODPALAMY MONITOR ZJAZDU DO BAZY
+        self.root.after(1000, self._wait_for_base_arrival)
+
+    def _wait_for_base_arrival(self):
+        # Sprawdzamy stan wszystkich łazików
+        all_parked = True
+        for rv in self.rovers:
+            # Łazik w bazie ma status "arrived", "idle" lub "charging" i prędkość kół równą 0
+            if rv.status not in ("arrived", "idle", "charging"):
+                all_parked = False
+                break
+        
+        if all_parked:
+            print("\n" + "=" * 60)
+            print("[SUKCES] Cała flota bezpiecznie zaparkowała i zsynchronizowała się w bazie!")
+            print("[SYSTEM] Rozpoczynam automatyczną procedurę mapowania awaryjnego...")
+            print("=" * 60)
+            
+            # AUTOMATYCZNY START PROFILU RECOVERY MAPPING
+            self._deploy_fleet_to_start_formation()
+        else:
+            # Jeśli chociaż jeden łazik wciąż jedzie lub się obraca, sprawdź ponownie za sekundę
+            current_states = [f"{rv.name}:{rv.status}" for rv in self.rovers]
+            print(f"[Monitor Parkowania]: Oczekiwanie... ({', '.join(current_states)})")
+            self.root.after(1000, self._wait_for_base_arrival)
+
+    def _deploy_fleet_to_start_formation(self):
+        print("\n" + "=" * 60)
+        print("[RECOVERY] DEPLOYING FLEET TO START FORMATION (ROW 0)")
+        print("=" * 60)
+
+        row_0_plants = []
+        for plant in self.plants:
+            try:
+                parts = plant.name.split('_')
+                plant_row = int(parts[2])
+                plant_col = int(parts[1])
+                
+                if plant_row == 0:
+                    row_0_plants.append((plant_col, plant))
+            except (IndexError, ValueError):
+                continue
+        
+        row_0_plants.sort(key=lambda item: item[0])
+        column_count = len(row_0_plants)
+        print(f"[INFO] Detected {column_count} columns of plants in row 0.")
+        print(f"[INFO] Assigning exactly {column_count} rovers to the mission.")
+        print("-" * 50)
+
+        self.deployed_rovers = []
+
+        for i in range(column_count):
+            if i >= len(self.rovers):
+                print("[WARNING] Not enough rovers to cover all detected plant columns!")
+                break
+                
+            rv = self.rovers[i]
+            _, plant = row_0_plants[i] 
+            
+            plant_x = plant.pos[0]
+            plant_y = plant.pos[1]
+            
+            # Target is 10 meters directly south of the plant
+            target_x = plant_x
+            target_y = plant_y - 15.0
+            
+            # --- CRITICAL FIX: FORCING PURE NORTH HEADING (math.pi/2 = 90 deg) ---
+            # This uses the Rover.py built-in alignment feature so the rover rotates 
+            # and points its camera directly at the ArUco marker upon arrival!
+            target_heading = math.pi / 2 
+            
+            print(f" -> [{rv.name}] moving to lane column #{i} [{plant.name}]. Target -> X: {target_x:.1f}, Y: {target_y:.1f}")
+            
+            if getattr(rv, 'panels_open', False):
+                rv.close_panels()
+                
+            # Passing target_heading to trigger final orientation alignment
+            rv.go_to(target_x, target_y, heading=target_heading)
+            self.deployed_rovers.append(rv)
+
+        if len(self.rovers) > column_count:
+            print("-" * 50)
+            for j in range(column_count, len(self.rovers)):
+                backup_rv = self.rovers[j]
+                print(f" -> [{backup_rv.name}] remains at the base station as backup.")
+                
+        print("-" * 50)
+        print("[SYSTEM] Fleet is moving to the starting lineup. Initializing formation monitor...")
+        print("=" * 60 + "\n")
+
+        self.root.after(1000, self._wait_for_formation_arrival)
+
+    def _wait_for_formation_arrival(self):
+        all_in_position = True
+        
+        # Check only the rovers that were sent out to the field
+        for rv in getattr(self, 'deployed_rovers', []):
+            if rv.status not in ("arrived", "idle"):
+                all_in_position = False
+                break
+                
+        if all_in_position:
+            print("\n" + "=" * 60)
+            print("[SUCCESS] All deployed rovers have reached the start formation layout!")
+            print("[SYSTEM] Initializing physical ArUco image scanning via OpenCV...")
+            print("=" * 60)
+            
+            # WYWOŁANIE ZCZYTYWANIA Z KAMER
+            self.scan_row_0_markers()
+        else:
+            # If any rover is still driving, check again in 1 second
+            self.root.after(1000, self._wait_for_formation_arrival)
+
+    def read_aruco_from_rover_camera(self, rv):
+        """
+        Odczytuje obraz bezpośrednio z uchwytu rv.camera.
+        Uniwersalna wersja - kompatybilna ze starszymi i nowszymi wersjami OpenCV.
+        """
+        with rv._class_lock:
+            try:
+                # 1. Sprawdzamy uchwyt kamery
+                camera_handle = getattr(rv, 'camera', None)
+                if camera_handle is None or camera_handle == -1:
+                    print(f"[CAMERA LINK ERROR] {rv.name} nie posiada poprawnego uchwytu self.camera!")
+                    return []
+                
+                # 2. Pobieramy bajty (0 = RGB)
+                image_bytes, resolution = rv.sim.getVisionSensorImg(camera_handle, 0)
+                
+                if not image_bytes or len(image_bytes) == 0:
+                    return []
+
+                # 3. Tworzymy i odwracamy macierz obrazu dla OpenCV
+                width, height = resolution[0], resolution[1]
+                img = np.frombuffer(image_bytes, dtype=np.uint8)
+                img.shape = (height, width, 3)
+                
+                img = cv2.flip(img, 0)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+                cv2.imwrite("debug.png", img)
+
+                # 4. Słownik ArUco
+                aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_50)
+                
+                parameters = cv2.aruco.DetectorParameters()
+                detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+                corners, ids, rejected = detector.detectMarkers(img)
+
+                # 6. Zapisujemy odczytane numery do listy
+                detected_ids = []
+                if ids is not None:
+                    detected_ids = [int(marker_id[0]) for marker_id in ids]
+                    
+                return detected_ids
+
+            except Exception as e:
+                print(f"[CAMERA ERROR] Błąd przetwarzania obrazu dla {rv.name}: {e}")
+                return []
+
+    def scan_row_0_markers(self, current_index=0):
+        if current_index == 0:
+            print("\n" + "=" * 70)
+            print("[RECOVERY] READING PHYSICAL ARUCO MARKERS FROM ROVER CAMERAS")
+            print("=" * 70)
+        
+        # Warunek stopu: wszystkie łaziki sprawdzone
+        if current_index >= len(getattr(self, 'deployed_rovers', [])):
+            print("\n" + "-" * 70)
+            print(" CURRENT EMERGENCY MAP COORDINATES (SAVED DATA):")
+            print("-" * 70)
+            if not self.emergency_map:
+                print(" [EMPTY] No coordinates saved yet.")
+            else:
+                for marker_id, data in self.emergency_map.items():
+                    # data to teraz krotka: (X, Y, nazwa_rosliny)
+                    plant_name = data[2]
+                    x_coord = data[0]
+                    y_coord = data[1]
+                    print(f" > Roślina: {plant_name:12} | ArUco ID: {marker_id:3} | Współrzędne: X= {x_coord:6.2f}, Y= {y_coord:6.2f}")
+            print("-" * 70)
+            print("=" * 70 + "\n")
+            return
+
+        rv = self.deployed_rovers[current_index]
+        
+        if rv.status in ("arrived", "idle"):
+            print(f" -> [{rv.name}] aktywacja kamery do skanowania wizyjnego...")
+            
+            detected_markers = self.read_aruco_from_rover_camera(rv)
+            
+            if detected_markers:
+                print(f"    [CAMERA SUCCESS] {rv.name} fizycznie odczytał ArUco ID: {detected_markers}")
+                
+                # --- IDENTYFIKACJA ROŚLINY ---
+                # Łazik sprawdza w bazie, jaka roślina stoi fizycznie przed jego maską
+                target_plant_name = "Nieznana"
+                for plant in self.plants:
+                    dist = math.hypot(plant.pos[0] - rv.pos[0], plant.pos[1] - rv.pos[1])
+                    # Szukamy rośliny blisko (do 6m), która jest przed łazikiem (Y wyższe niż Y łazika)
+                    if dist <= 6.0 and plant.pos[1] > rv.pos[1] and abs(plant.pos[0] - rv.pos[0]) <= 2.0:
+                        target_plant_name = plant.name
+                        break
+                
+                for marker_id in detected_markers:
+                    if marker_id not in self.emergency_map:
+                        estimated_plant_x = rv.pos[0]
+                        estimated_plant_y = rv.pos[1] + 5.0
+                        
+                        # Zapisujemy do słownika TRZY wartości: X, Y oraz pobraną nazwę rośliny
+                        self.emergency_map[marker_id] = (estimated_plant_x, estimated_plant_y, target_plant_name)
+                        
+            else:
+                print(f"    [CAMERA BLANK] {rv.name} patrzy, ale nie widzi markerów.")
+
+        # Opóźnienie 500ms dla stabilności wideo i GUI
+        self.root.after(500, lambda: self.scan_row_0_markers(current_index + 1))
+        
 
     # ── UI builder ─────────────────────────────────────────────────────────
 
@@ -483,6 +779,11 @@ class NavApp:
                   command=self._stop_all).grid(row=0, column=9, padx=4)
         tk.Button(ctrl, text="Reset zoom", width=10,
                   command=self._reset_zoom).grid(row=0, column=10, padx=4)
+
+        self.recovery_btn = tk.Button(ctrl, text="⚠️ AWARYJNY POWRÓT", width=18, 
+                                      bg="#962d22", fg="white", font=("Arial", 9, "bold"),
+                                      command=self.recovery_mode)
+        self.recovery_btn.grid(row=0, column=11, padx=12)
 
         self.status_lbl = tk.Label(root, text="", anchor="w", fg="gray")
         self.status_lbl.pack(padx=10, fill="x")
@@ -911,6 +1212,7 @@ class NavApp:
             if plant.name in self.plant_map_items:
                 self.canvas.itemconfig(self.plant_map_items[plant.name][0], fill=dot_color)
 
+    
 
 # ── Entry point ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
