@@ -19,8 +19,8 @@ class Rover:
     _class_lock = threading.RLock()
 
     # Battery drain (%/s)
-    DRAIN_IDLE          = 0.05
-    DRAIN_MOVING        = 0.50
+    DRAIN_IDLE          = 0.0005
+    DRAIN_MOVING        = 0.0050
     DRAIN_TASK          = 1.00
     # Battery charge (%/s)
     STATION_CHARGE_RATE = 5.0
@@ -498,6 +498,34 @@ class Rover:
             self._target_heading = float(heading) if heading is not None else None
             self._waypoints      = []
             self.status          = "moving"
+
+    def go_to_square(self, x: float, y: float, heading: float = None):
+        """
+        Navigate to (x, y) using Manhattan logic: 
+        moves along the Y axis first, then along the X axis.
+        """
+        if self.panels_open:
+            print(f"[{self.name}] panels open — close before moving")
+            return
+        if self.status == "dead":
+            return
+            
+        self.charging_target = None
+        
+        with self._nav_lock:
+            # Odczytujemy aktualną pozycję X łazika
+            current_x = float(self.pos[0])
+            
+            # KROK 1: Jedziemy najpierw po osi Y (X pozostaje bez zmian)
+            self._target = (current_x, float(y))
+            
+            # KROK 2: Kiedy dojedzie na oś Y, skręca i jedzie do ostatecznego (x, y)
+            self._waypoints = [(float(x), float(y))]
+            
+            # Obkręcenie kamery na finałowym punkcie
+            self._target_heading = float(heading) if heading is not None else None
+            
+            self.status = "moving"
 
     def go_to_base(self):
         """Return to spawn / home position."""

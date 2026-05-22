@@ -9,6 +9,15 @@ class RecoveryManager:
         'app' to instancja NavApp, dzięki której mamy dostęp do list i GUI.
         """
         self.app = app
+        self.current_scan_row = None
+
+        self.last_plant_positions = {}
+        self.lane_x_positions = {}
+
+        self.maneuver_stage = None
+        self.rover_offsets = {}
+
+        self.MAX_ROWS = 4
 
     # ── RECOVERY ────────────────────────────────────────────────   
     def recovery_mode(self):
@@ -73,6 +82,8 @@ class RecoveryManager:
         print("[RECOVERY] DEPLOYING FLEET TO START FORMATION (ROW 0)")
         print("=" * 60)
 
+        self.current_scan_row = 0
+
         row_0_plants = []
         for plant in self.app.plants:
             try:
@@ -105,7 +116,7 @@ class RecoveryManager:
             plant_y = plant.pos[1]
             
             target_x = plant_x
-            target_y = plant_y - 15.0
+            target_y = plant_y - 10.0
             
             target_heading = math.pi / 2 
             
@@ -143,7 +154,7 @@ class RecoveryManager:
             print("[SYSTEM] Initializing physical ArUco image scanning via OpenCV...")
             print("=" * 60)
             
-            self.scan_row_0_markers()
+            self.scan_row_markers()
         else:
             self.app.root.after(1000, self._wait_for_formation_arrival)
 
@@ -184,15 +195,16 @@ class RecoveryManager:
                 print(f"[CAMERA ERROR] Błąd przetwarzania obrazu dla {rv.name}: {e}")
                 return []
 
-    def scan_row_0_markers(self, current_index=0):
+    def scan_row_markers(self, current_index=0):
         if current_index == 0:
             print("\n" + "=" * 70)
-            print("[RECOVERY] READING PHYSICAL ARUCO MARKERS FROM ROVER CAMERAS")
+            print(f"[RECOVERY] READING MARKERS FOR ROW {getattr(self, 'current_scan_row', 0)}")
             print("=" * 70)
         
+        # Warunek stopu: wszystkie łaziki w aktualnym rzędzie odpytane
         if current_index >= len(getattr(self.app, 'deployed_rovers', [])):
             print("\n" + "-" * 70)
-            print(" CURRENT EMERGENCY MAP COORDINATES (SAVED DATA):")
+            print(f" STAN MAPY AWARYJNEJ (PO RZĘDZIE {getattr(self, 'current_scan_row', 0)}):")
             print("-" * 70)
             if not getattr(self.app, 'emergency_map', {}):
                 print(" [EMPTY] No coordinates saved yet.")
@@ -201,9 +213,12 @@ class RecoveryManager:
                     plant_name = data[2]
                     x_coord = data[0]
                     y_coord = data[1]
-                    print(f" > Roślina: {plant_name:12} | ArUco ID: {marker_id:3} | Współrzędne: X= {x_coord:6.2f}, Y= {y_coord:6.2f}")
+                    print(f" > Roślina: {plant_name:12} | ArUco ID: {marker_id:3} | X= {x_coord:6.2f}, Y= {y_coord:6.2f}")
             print("-" * 70)
             print("=" * 70 + "\n")
+
+            # ODPALAMY SKOK DO KOLEJNEGO RZĘDU
+            self.move_next_row()
             return
 
         rv = self.app.deployed_rovers[current_index]
@@ -216,6 +231,7 @@ class RecoveryManager:
             if detected_markers:
                 print(f"    [CAMERA SUCCESS] {rv.name} fizycznie odczytał ArUco ID: {detected_markers}")
                 
+                # --- IDENTYFIKACJA ROŚLINY ---
                 target_plant_name = "Nieznana"
                 for plant in self.app.plants:
                     dist = math.hypot(plant.pos[0] - rv.pos[0], plant.pos[1] - rv.pos[1])
@@ -223,16 +239,129 @@ class RecoveryManager:
                         target_plant_name = plant.name
                         break
                 
+                # --- KLUCZOWA PĘTLA (Tutaj wywalało błąd!) ---
                 for marker_id in detected_markers:
                     if marker_id not in self.app.emergency_map:
+                        # Na razie hardcodowane wartości (zmienimy je później)
                         estimated_plant_x = rv.pos[0]
-                        estimated_plant_y = rv.pos[1] + 5.0
+                        estimated_plant_y = rv.pos[1] + 10.0
                         
+                        # Zapis do mapy awaryjnej
                         self.app.emergency_map[marker_id] = (estimated_plant_x, estimated_plant_y, target_plant_name)
+                        
+                        # Zapis do pamięci łazika pod kątem manewru geometrycznego
+                        self.last_plant_positions[rv.name] = [estimated_plant_x, estimated_plant_y]
+                # ---------------------------------------------
                         
             else:
                 print(f"    [CAMERA BLANK] {rv.name} patrzy, ale nie widzi markerów.")
 
-        self.app.root.after(500, lambda: self.scan_row_0_markers(current_index + 1))
+        self.app.root.after(500, lambda: self.scan_row_markers(current_index + 1))
+
+    def _wait_for_maneuver(self):
+        """Pętla czekająca na fizyczny dojazd wszystkich łazików w danym etapie."""
+        all_arrived = True
+        for rv in self.app.deployed_rovers:
+            # Dopóki robot jest w stanie "moving", flaga jest False
+            if rv.status not in ("arrived", "idle"):
+                all_arrived = False
+                break
+                
+        if all_arrived:
+            if self.maneuver_stage == 4:
+                # Kiedy łaziki wyrównają kamery (krok 4), wracamy do pętli skanowania
+                self.scan_row_markers()
+            else:
+                # Jeśli to krok 1, 2 lub 3 -> przechodzimy do kolejnego kroku
+                self.maneuver_stage += 1
+                self._execute_maneuver_stage()
+        else:
+            # Jeśli wciąż jadą, sprawdź ponownie za pół sekundy
+            self.app.root.after(500, self._wait_for_maneuver)
+
+    def move_next_row(self):
+        """Rozpoczyna manewr wyprzedzania z podziałem na etapy, by uniknąć nadpisywania komend."""
+        self.current_scan_row += 1
+
+        # Upewnij się, że masz ustawione self.MAX_ROWS w __init__
+        if self.current_scan_row > getattr(self, 'MAX_ROWS', 4):
+            print("\n" + "*" * 70)
+            print("[MISSION COMPLETE] Flota zbadala wszystkie rzędy. Mapa awaryjna jest pełna!")
+            print("*" * 70 + "\n")
+            return
+
+        print("\n" + "=" * 70)
+        print(f"[SYSTEM] Omijanie przeszkody i jazda do RZĘDU {self.current_scan_row}...")
+        print("=" * 70)
+        
+        # Jeśli nie masz tego w __init__, inicjalizujemy słownik do trzymania offsetów
+        if not hasattr(self, 'rover_offsets'):
+            self.rover_offsets = {}
+
+        self.maneuver_stage = 1
+        self._execute_maneuver_stage()
+
+    def _execute_maneuver_stage(self):
+        """Zarządza kolejnymi krokami geometrycznymi. Pomiędzy krokami system czeka na dojazd."""
+        
+        if self.maneuver_stage == 1:
+            print("[MANEWR 1/4] Odjazd w prawo (Wyliczanie kąta 45 stopni)")
+            for rv in self.app.deployed_rovers:
+                # Zapisujemy pas startowy przed ruchem
+                self.lane_x_positions[rv.name] = rv.pos[0]
+                plant_pos = self.last_plant_positions.get(rv.name)
+                
+                if plant_pos:
+                    dist_to_plant = abs(plant_pos[1] - rv.pos[1])
+                    offset_x = dist_to_plant
+                else:
+                    print(f"    [WARNING] Brak danych o rośliny dla {rv.name}! Zakładam offset 2m.")
+                    offset_x = 2.0
+                
+                # Zapisujemy wyliczony offset dla tego łazika, by użyć go w kroku 2!
+                self.rover_offsets[rv.name] = offset_x
+                
+                target_x = rv.pos[0] + offset_x
+                print(f"    -> [{rv.name}] Odjeżdżam {offset_x:.2f}m w prawo.")
+                # heading=0.0 -> wschód
+                rv.go_to(target_x, rv.pos[1], heading=0.0)
+                
+            # Po wydaniu komend, czekamy aż łaziki tam dojadą!
+            self.app.root.after(1000, self._wait_for_maneuver)
+
+        elif self.maneuver_stage == 2:
+            print("[MANEWR 2/4] Jazda w górę pola")
+            for rv in self.app.deployed_rovers:
+                # Odzyskujemy wyliczony wcześniej offset
+                offset_x = self.rover_offsets.get(rv.name, 2.0)
+                
+                # Używamy Twojej matematyki: 2 * offset_x
+                target_y = rv.pos[1] + (2 * offset_x)
+                print(f"    -> [{rv.name}] Odjeżdżam {2*offset_x:.2f}m w górę.")
+                # heading=math.pi/2 -> północ
+                rv.go_to(rv.pos[0], target_y, heading=math.pi / 2)
+                
+            self.app.root.after(1000, self._wait_for_maneuver)
+
+        elif self.maneuver_stage == 3:
+            print("[MANEWR 3/4] Powrót w lewo na główny pas ruchu")
+            for rv in self.app.deployed_rovers:
+                # Wracamy bezpiecznie do zapisanego na samym początku X z pasa ruchu
+                target_x = self.lane_x_positions.get(rv.name, rv.pos[0] - 2.0)
+                print(f"    -> [{rv.name}] Wracam na pas {target_x:.2f} na osi X.")
+                # heading=math.pi -> zachód
+                rv.go_to(target_x, rv.pos[1], heading=math.pi)
+                
+            self.app.root.after(1000, self._wait_for_maneuver)
+
+        elif self.maneuver_stage == 4:
+            print("[MANEWR 4/4] Wyrównanie kamer na wprost przed nowym rzędem!")
+            for rv in self.app.deployed_rovers:
+                # Tylko obrót na północ
+                rv.go_to(rv.pos[0], rv.pos[1], heading=math.pi / 2)
+            
+            self.app.root.after(1000, self._wait_for_maneuver)
+        
+
 
     
