@@ -1,0 +1,7 @@
+# Optional dependencies for advanced allocation and MAPF
+numpy
+opencv-contrib-python   # includes cv2.aruco
+pyzmq                   # ZeroMQ bindings
+coppeliasim-zmqremoteapi-client
+# For integer linear assignment alternatives (optional)
+# ortools>=9.9

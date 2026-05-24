@@ -17,7 +17,8 @@ from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 client = None
 sim    = None
 
-
+#dodanie planisty
+from planner import Planista
 # ── Environment setup ──────────────────────────────────────────────────────
 
 def setup_environment():
@@ -315,12 +316,13 @@ STATUS_COLORS = {
 
 # ── Main application ───────────────────────────────────────────────────────
 class NavApp:
-    def __init__(self, root, rovers, base_pos, stations, plants=None):
+    def __init__(self, root, rovers, base_pos, stations, plants=None, planista=None):
         self.root     = root
         self.rovers   = rovers
         self.stations = stations
         self.base_pos = base_pos
         self.plants   = plants or []
+        self.planista = planista
 
         self._drag_start      = None
         self._pending_heading = None
@@ -338,6 +340,9 @@ class NavApp:
         root.title("Nawigacja Roverow")
         self._build_ui()
         self._update_loop()
+
+
+
 
     # ── Coordinate helpers ─────────────────────────────────────────────────
 
@@ -487,6 +492,43 @@ class NavApp:
         self.status_lbl = tk.Label(root, text="", anchor="w", fg="gray")
         self.status_lbl.pack(padx=10, fill="x")
 
+#ui plannera
+        planner_frame = tk.LabelFrame(top, text="Planista")
+        planner_frame.pack(side=tk.LEFT, fill="y", padx=(4, 0))
+
+        tk.Button(
+            planner_frame,
+            text="1. Wszystkie sprawne",
+            command=lambda: self.planista.scenario_all_rovers_ok()
+        ).pack(fill="x", padx=5, pady=2)
+
+        tk.Button(
+            planner_frame,
+            text="2. Awaria K=2",
+            command=lambda: self.planista.scenario_k_rovers_failure(2)
+        ).pack(fill="x", padx=5, pady=2)
+
+        tk.Button(
+            planner_frame,
+            text="3. Rozładowanie baterii",
+            command=lambda: self.planista.scenario_battery_depletion()
+        ).pack(fill="x", padx=5, pady=2)
+
+        tk.Button(
+            planner_frame,
+            text="Dodaj wszystkie pola",
+            command=lambda: self.planista.add_all_fields_to_queue()
+        ).pack(fill="x", padx=5, pady=8)
+        #reset
+        tk.Button(
+            planner_frame,
+            text="RESET łazików do bazy",
+            command=lambda: self.planista.reset_rovers_to_start()
+        ).pack(fill="x", padx=5, pady=2)
+        tk.Label(planner_frame, text="Kolejka zadań:").pack(anchor="w", padx=5)
+
+        self.task_queue_listbox = tk.Listbox(planner_frame, height=18, width=56)
+        self.task_queue_listbox.pack(padx=5, pady=5, fill="both")
     # ── Static map drawing ─────────────────────────────────────────────────
 
     def _draw_grid(self):
@@ -597,6 +639,10 @@ class NavApp:
                 vl.pack(side=tk.LEFT, padx=(1, 2))
                 val_labels[key] = vl
 
+            state_lbl = tk.Label(row, text="WAITING", width=18,
+                                 font=("Arial", 8), fg="#f39c12", bg="white")
+            state_lbl.pack(side=tk.LEFT, padx=(4, 2))
+
             move_btn = tk.Button(row, text="Move", width=4, font=("Arial", 7),
                                  command=lambda pl=p: self._send_to_plant(pl))
             move_btn.pack(side=tk.LEFT, padx=(4, 1))
@@ -610,8 +656,12 @@ class NavApp:
             repair_btn.pack(side=tk.LEFT, padx=(1, 4))
 
             self.plant_widgets[p.name] = {
-                'h_val': val_labels["h"], 'f_val': val_labels["f"], 'd_val': val_labels["d"],
-                'scan_btn': scan_btn, 'repair_btn': repair_btn,
+                'h_val': val_labels["h"],
+                'f_val': val_labels["f"],
+                'd_val': val_labels["d"],
+                'state': state_lbl,
+                'scan_btn': scan_btn,
+                'repair_btn': repair_btn,
             }
 
     # ── Map interaction ─────────────────────────────────────────────────────
@@ -839,7 +889,23 @@ class NavApp:
                 pass
 
         self._update_plants()
+        self._update_task_queue_box()
         self.root.after(150, self._update_loop)
+
+    #funkcja do aktualizacji kolejki zadań
+    def _update_task_queue_box(self):
+        if not self.planista:
+            return
+
+        if not hasattr(self, "task_queue_listbox"):
+            return
+
+        self.task_queue_listbox.delete(0, tk.END)
+
+        queue = self.planista.get_queue_details()
+
+        for item in queue:
+            self.task_queue_listbox.insert(tk.END, item)
 
     def _draw_rover_route(self, rv, color):
         for item in self.rover_target_items.get(rv.name, []):
@@ -864,52 +930,113 @@ class NavApp:
     def _update_plants(self):
         if not self.plants:
             return
+
         for plant in self.plants:
-            wgt  = self.plant_widgets[plant.name]
+            if plant.name not in self.plant_widgets:
+                continue
+
+            wgt = self.plant_widgets[plant.name]
             scan = self._plant_scan[plant.name]
 
-            # Collect scan results as they arrive
-            if scan['state'] == 'scanning':
-                for param, key in [('humidity','h'), ('fertility','f'), ('crop_density','d')]:
-                    if key not in scan['received']:
+            # Stan pola z Planisty
+            if self.planista and plant.name in self.planista.fields:
+                field_state = self.planista.fields[plant.name].state.name
+
+                state_text = {
+                    "WAITING_FOR_MEASUREMENT": "OCZEKUJE",
+                    "OCCUPIED": "ZAJĘTE",
+                    "DONE": "OBSŁUŻONE",
+                }.get(field_state, field_state)
+
+                state_color = {
+                    "WAITING_FOR_MEASUREMENT": "#f39c12",
+                    "OCCUPIED": "#3498db",
+                    "DONE": "#2ecc71",
+                }.get(field_state, "gray")
+
+                if "state" in wgt:
+                    wgt["state"].config(text=state_text, fg=state_color)
+
+            # Odczyt wyników skanowania
+            if scan["state"] == "scanning":
+                for param, key in [
+                    ("humidity", "h"),
+                    ("fertility", "f"),
+                    ("crop_density", "d"),
+                ]:
+                    if key not in scan["received"]:
                         state, val = plant.get_measure(param)
-                        if state == 'ready':
-                            scan['vals'][key] = val
-                            scan['received'].add(key)
-                if scan['received'] == {'h', 'f', 'd'}:
-                    # Persist values and return to idle
-                    scan['display'] = dict(scan['vals'])
-                    scan['state']   = 'idle'
-                    scan['received'].clear()
-                    scan['vals'].clear()
 
-            # Update value labels: scan snapshot only (or "?" while scanning)
-            if scan['state'] == 'scanning':
-                for k in ('h', 'f', 'd'):
-                    wgt[f'{k}_val'].config(text="?", fg="#3498db")
-            elif scan['display']:
-                d = scan['display']
-                for k, key in (('h','h'), ('f','f'), ('d','d')):
-                    v = d[key]
-                    c = "#2ecc71" if v > 60 else "#f39c12" if v > 30 else "#e74c3c"
-                    wgt[f'{k}_val'].config(text=f"{v:.0f}%", fg=c)
+                        if state == "ready":
+                            scan["vals"][key] = val
+                            scan["received"].add(key)
+
+                if scan["received"] == {"h", "f", "d"}:
+                    scan["display"] = dict(scan["vals"])
+                    scan["state"] = "idle"
+                    scan["received"].clear()
+                    scan["vals"].clear()
+
+            # Aktualizacja wartości H/F/D
+            if scan["state"] == "scanning":
+                for k in ("h", "f", "d"):
+                    wgt[f"{k}_val"].config(text="?", fg="#3498db")
+
+            elif scan["display"]:
+                d = scan["display"]
+
+                for k in ("h", "f", "d"):
+                    v = d.get(k)
+
+                    if v is None:
+                        wgt[f"{k}_val"].config(text="--", fg="#888")
+                        continue
+
+                    color = "#2ecc71" if v > 60 else "#f39c12" if v > 30 else "#e74c3c"
+                    wgt[f"{k}_val"].config(text=f"{v:.0f}%", fg=color)
+
             else:
-                for k in ('h', 'f', 'd'):
-                    wgt[f'{k}_val'].config(text="--", fg="#888")
+                # Jeżeli nie było ręcznego skanu, pokazuj aktualne wartości z obiektu Plant
+                live_values = {
+                    "h": plant.humidity,
+                    "f": plant.fertility,
+                    "d": plant.crop_density,
+                }
 
-            # Buttons
+                for k, v in live_values.items():
+                    color = "#2ecc71" if v > 60 else "#f39c12" if v > 30 else "#e74c3c"
+                    wgt[f"{k}_val"].config(text=f"{v:.0f}%", fg=color)
+
+            # Przyciski
             nearby = plant.rover_nearby(self.rovers)
-            busy   = plant.action is not None
-            wgt['scan_btn'].config(
-                state=tk.DISABLED if (scan['state'] != 'idle' or not nearby) else tk.NORMAL)
-            wgt['repair_btn'].config(
-                state=tk.DISABLED if busy else tk.NORMAL)
+            busy = plant.action is not None
 
-            # Map dot colour by worst live parameter
-            worst = min(plant.humidity, plant.fertility, plant.crop_density)
-            dot_color = ("#e74c3c" if worst < 30 else "#f39c12" if worst < 60 else "#27ae60")
+            wgt["scan_btn"].config(
+                state=tk.DISABLED if (scan["state"] != "idle" or not nearby) else tk.NORMAL
+            )
+
+            wgt["repair_btn"].config(
+                state=tk.DISABLED if busy else tk.NORMAL
+            )
+
+            # Kolor roślinki na mapie wg najgorszego parametru
+            worst = min(
+                plant.humidity,
+                plant.fertility,
+                plant.crop_density,
+            )
+
+            dot_color = (
+                "#e74c3c" if worst < 30
+                else "#f39c12" if worst < 60
+                else "#27ae60"
+            )
+
             if plant.name in self.plant_map_items:
-                self.canvas.itemconfig(self.plant_map_items[plant.name][0], fill=dot_color)
+                self.canvas.itemconfig(
+                    self.plant_map_items[plant.name][0],
+                    fill=dot_color,
+                )
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
@@ -932,6 +1059,30 @@ if __name__ == "__main__":
         plants = detect_plants()
         print(f"Znaleziono {len(plants)} roslin")
 
+        # root = tk.Tk()
+        # NavApp(root, rovers, base_pos, stations, plants)
+        # root.mainloop()
+
+        planista = Planista(
+            rovers=rovers,
+            plants=plants,
+            charging_stations=stations,
+            base_pos=base_pos,
+        )
+
+        planista.start()
+
         root = tk.Tk()
-        NavApp(root, rovers, base_pos, stations, plants)
-        root.mainloop()
+        NavApp(
+            root,
+            rovers,
+            base_pos,
+            stations,
+            plants,
+            planista=planista
+        )
+
+        try:
+            root.mainloop()
+        finally:
+            planista.stop()
