@@ -168,8 +168,8 @@ def setup_environment():
             if use_aruco:
                 try:
                     plane_h     = _sim.getObject('./aruco_plane', {'proxy': h})
-                    tex_res     = 512
-                    marker_size = 392
+                    tex_res     = 256
+                    marker_size = 196
                     visual_id   = i + 10
                     try:
                         marker = cv2.aruco.generateImageMarker(aruco_dict, visual_id, marker_size)
@@ -230,22 +230,25 @@ def detect_rovers(charging_stations: dict, base_pos=None) -> list:
     _fallback = {1:(0,0,0), 2:(0,0,0), 3:(0,0,0), 4:(0,0,0)}
     cs = charging_stations or _fallback
 
+    # Probe rover_1, rover_2, ... and stop at the first gap.
+    # Build jmap here so Rover.__init__ can reuse it without a second
+    # getObjectsInTree + N×getObjectAlias round-trip per rover.
     rover_data = []
     for i in range(1, 21):
         try:
             with Rover._class_lock:
                 obj    = sim.getObject(f'/rover_{i}')
                 joints = sim.getObjectsInTree(obj, sim.object_joint_type, 0)
-                jnames = {sim.getObjectAlias(j, 0) for j in joints}
-                if 'front_left_wheel_joint' not in jnames:
+                jmap   = {sim.getObjectAlias(j, 0): j for j in joints}
+                if 'front_left_wheel_joint' not in jmap:
                     continue
                 pos = sim.getObjectPosition(obj, -1)
-            rover_data.append((obj, f'rover_{i}', pos))
+            rover_data.append((obj, f'rover_{i}', pos, jmap))
         except Exception:
-            continue
+            break   # first gap → no more rovers
 
     if not rover_data:
-        # Fallback: full-scene scan (slower, keeps compatibility)
+        # Fallback: full-scene scan
         with Rover._class_lock:
             for obj in sim.getObjectsInTree(sim.handle_scene, sim.handle_all, 1):
                 if sim.getObjectParent(obj) != -1:
@@ -254,16 +257,17 @@ def detect_rovers(charging_stations: dict, base_pos=None) -> list:
                 if not alias.startswith('rover'):
                     continue
                 joints = sim.getObjectsInTree(obj, sim.object_joint_type, 0)
-                jnames = {sim.getObjectAlias(j, 0) for j in joints}
-                if 'front_left_wheel_joint' not in jnames:
+                jmap   = {sim.getObjectAlias(j, 0): j for j in joints}
+                if 'front_left_wheel_joint' not in jmap:
                     continue
                 pos = sim.getObjectPosition(obj, -1)
-                rover_data.append((obj, alias, pos))
+                rover_data.append((obj, alias, pos, jmap))
 
     rovers = []
-    for obj, name, pos in rover_data:
+    for obj, name, pos, jmap in rover_data:
         rv = Rover(sim=sim, handle=obj, spawn_coords=pos,
-                   charging_stations=cs, base_pos=base_pos)
+                   charging_stations=cs, base_pos=base_pos,
+                   prebuilt_jmap=jmap)
         rovers.append(rv)
         print(f"Wykryto rover: {name}")
 

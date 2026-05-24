@@ -31,6 +31,7 @@ class Rover:
     HEADING_THRESH = 0.05
     MAX_SPEED      = 10.0
     MAX_TURN       = 6.0
+    MIN_TURN       = 0.8   # minimum wheel speed during orientation so motors don't stall
     WARN_DIST      = 3.5
     STOP_DIST      = 1.8
 
@@ -48,7 +49,8 @@ class Rover:
     _PANEL_CLOSED = {"left_panel_joint": -math.pi / 2,   "right_panel_joint":  math.pi / 2}
 
     def __init__(self, sim, handle: int, spawn_coords, charging_stations,
-                 base_pos=None, panels_open: bool = False):
+                 base_pos=None, panels_open: bool = False,
+                 prebuilt_jmap: dict = None):
         """
         sim               : CoppeliaSim sim proxy
         handle            : model handle in the scene
@@ -89,12 +91,13 @@ class Rover:
         self._panel_joints = {}     # jname → handle
 
         # Navigation state
-        self._target         = None
-        self._target_heading = None
-        self._waypoints      = []   # intermediate (x,y) waypoints before target
-        self._nav_lock       = threading.RLock()
-        self.status          = "idle"
-        self.charging_target = None   # station ID rover is navigating to
+        self._target           = None
+        self._target_heading   = None
+        self._waypoints        = []   # intermediate (x,y) waypoints before target
+        self._orient_err_sign  = 0    # sign of heading error on previous tick (zero-crossing detect)
+        self._nav_lock         = threading.RLock()
+        self.status            = "idle"
+        self.charging_target   = None   # station ID rover is navigating to
 
         # Fleet awareness — set externally after all rovers are created
         self.all_rovers = []
@@ -105,7 +108,7 @@ class Rover:
 
         self._left_wheels  = []
         self._right_wheels = []
-        self._init_joints()
+        self._init_joints(prebuilt_jmap=prebuilt_jmap)
 
         self._running = True
         self._thread  = threading.Thread(
@@ -117,12 +120,19 @@ class Rover:
 
     # ── Setup ──────────────────────────────────────────────────────────────
 
-    def _init_joints(self):
-        """Discover and configure wheel + panel joints."""
-        with Rover._class_lock:
-            all_joints = self.sim.getObjectsInTree(
-                self.handle, self.sim.object_joint_type, 0)
-            jmap = {self.sim.getObjectAlias(j, 0): j for j in all_joints}
+    def _init_joints(self, prebuilt_jmap: dict = None):
+        """Discover and configure wheel + panel joints.
+
+        Pass prebuilt_jmap to skip the getObjectsInTree + getObjectAlias
+        round-trips (useful when the caller already fetched this data).
+        """
+        if prebuilt_jmap is not None:
+            jmap = prebuilt_jmap
+        else:
+            with Rover._class_lock:
+                all_joints = self.sim.getObjectsInTree(
+                    self.handle, self.sim.object_joint_type, 0)
+                jmap = {self.sim.getObjectAlias(j, 0): j for j in all_joints}
 
         self._left_wheels  = []
         self._right_wheels = []
@@ -384,16 +394,21 @@ class Rover:
                     dy = ty - my_y
                     dist = math.hypot(dx, dy)
                 else:
-                    # Final destination reached
+                    # Final destination reached — adjust to target heading if given
                     if target_heading is not None:
-                        err = _normalize_angle(target_heading - self.heading)
-                        if abs(err) > self.HEADING_THRESH:
-                            turn = min(self.MAX_TURN, abs(err) * 2.0)
-                            sign = 1 if err > 0 else -1
+                        err  = _normalize_angle(target_heading - self.heading)
+                        sign = 1 if err > 0 else -1
+                        crossed = (self._orient_err_sign != 0
+                                   and sign != self._orient_err_sign)
+                        if not crossed and abs(err) > self.HEADING_THRESH:
+                            self._orient_err_sign = sign
+                            turn = max(self.MIN_TURN,
+                                       min(self.MAX_TURN, abs(err) * 2.0))
                             self.status = "moving"
                             return sign * turn, -sign * turn
-                    self._target         = None
-                    self._target_heading = None
+                    self._orient_err_sign = 0
+                    self._target          = None
+                    self._target_heading  = None
                     self.status = "arrived"
                     return 0.0, 0.0
 
@@ -439,10 +454,11 @@ class Rover:
             return
         self.charging_target = None
         with self._nav_lock:
-            self._target         = (float(x), float(y))
-            self._target_heading = float(heading) if heading is not None else None
-            self._waypoints      = []
-            self.status          = "moving"
+            self._target          = (float(x), float(y))
+            self._target_heading  = float(heading) if heading is not None else None
+            self._waypoints       = []
+            self._orient_err_sign = 0
+            self.status           = "moving"
 
     def go_to_base(self):
         """Return to spawn / home position."""
@@ -454,10 +470,11 @@ class Rover:
         self.charging_target = None
         x, y = self.spawn_coords[0], self.spawn_coords[1]
         with self._nav_lock:
-            self._target         = (x, y)
-            self._target_heading = None
-            self._waypoints      = []
-            self.status          = "moving"
+            self._target          = (x, y)
+            self._target_heading  = None
+            self._waypoints       = []
+            self._orient_err_sign = 0
+            self.status           = "moving"
 
     def go_to_charging_station(self, station_id: int):
         """
@@ -479,10 +496,11 @@ class Rover:
 
         self.charging_target = station_id
         with self._nav_lock:
-            self._target         = all_wps[0]
-            self._target_heading = None
-            self._waypoints      = all_wps[1:]
-            self.status          = "moving"
+            self._target          = all_wps[0]
+            self._target_heading  = None
+            self._waypoints       = all_wps[1:]
+            self._orient_err_sign = 0
+            self.status           = "moving"
 
     def stop(self):
         """Stop and cancel goal. Clears charging target (leaves station)."""

@@ -121,9 +121,9 @@ def setup_simulation_environment():
             
             try:
                 plane_handle = sim.getObject('./aruco_plane', {'proxy': handle})
-                tex_res = 512
+                tex_res = 256
                 visual_id = i + 10
-                marker_size_px = 392
+                marker_size_px = 196
                 
                 try:
                     base_marker = cv2.aruco.generateImageMarker(aruco_dict, visual_id, marker_size_px)
