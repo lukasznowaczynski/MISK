@@ -115,8 +115,8 @@ class RecoveryManager:
             plant_x = plant.pos[0]
             plant_y = plant.pos[1]
             
-            target_x = plant_x
-            target_y = plant_y - 10.0
+            target_x = plant_x - 2.0
+            target_y = plant_y - 5.0
             
             target_heading = math.pi / 2 
             
@@ -180,16 +180,65 @@ class RecoveryManager:
 
                 cv2.imwrite(f"debug_{rv.name}.png", img)
 
-                aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_50)
+                aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
                 parameters = cv2.aruco.DetectorParameters()
                 detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
                 corners, ids, rejected = detector.detectMarkers(img)
 
-                detected_ids = []
+                detected_data = {}
+                
                 if ids is not None:
-                    detected_ids = [int(marker_id[0]) for marker_id in ids]
+                    # 1. PARAMETRY WEWNĘTRZNE KAMERY (Symulacja FOV 100 stopni, 256x256 px)
+                    fov_rad = rv.sim.getObjectFloatParam(camera_handle, rv.sim.visionfloatparam_perspective_angle)
+                    cx = width / 2.0
+                    cy = height / 2.0
                     
-                return detected_ids
+                    # Wyliczenie ogniskowej z dynamicznych wartości
+                    focal_length = cx / math.tan(fov_rad / 2.0)
+
+                    print(f"FOV_RAD: {fov_rad:.2f}, FOCAL_LENGTH: {focal_length:.2f}")
+
+                    # fov_rad = math.radians(100)
+                    # focal_length = (256 / 2.0) / math.tan(fov_rad / 2.0)
+
+                    # print(f"FOV_RAD2: {fov_rad:.2f}, FOCAL_LENGTH2: {focal_length:.2f}")
+                    
+                    camera_matrix = np.array([
+                        [focal_length, 0, 128],
+                        [0, focal_length, 128],
+                        [0, 0, 1]
+                    ], dtype=np.float32)
+                    
+                    dist_coeffs = np.zeros((4, 1))
+
+                    # 2. ROZMIAR FIZYCZNY MARKERA (0.3 metra wg nav_gui.py)
+                    marker_size = 0.3
+                    obj_points = np.array([
+                        [-marker_size/2,  marker_size/2, 0],
+                        [ marker_size/2,  marker_size/2, 0],
+                        [ marker_size/2, -marker_size/2, 0],
+                        [-marker_size/2, -marker_size/2, 0]
+                    ], dtype=np.float32)
+
+                    # 3. WYLICZANIE ODLEGŁOŚCI DLA KAŻDEGO ZNALEZIONEGO KODU
+                    for i in range(len(ids)):
+                        marker_id = int(ids[i][0])
+                        corner = corners[i]
+                        
+                        success, rvec, tvec = cv2.solvePnP(obj_points, corner, camera_matrix, dist_coeffs)
+                        
+                        if success:
+                            # tvec[0][0] to przesunięcie w lewo/prawo od środka obiektywu
+                            offset_x = tvec[0][0]
+                            
+                            # tvec[2][0] to odległość w linii prostej przed obiektywem.
+                            # Dodajemy 0.75m, bo obiektyw wisi przed środkiem masy łazika!
+                            offset_z = tvec[2][0] + 0.75 
+                            
+                            # Zwracamy krotkę: (przesunięcie_boczne, odległość_na_wprost)
+                            detected_data[marker_id] = (offset_x, offset_z)
+                            
+                return detected_data
 
             except Exception as e:
                 print(f"[CAMERA ERROR] Błąd przetwarzania obrazu dla {rv.name}: {e}")
@@ -231,27 +280,47 @@ class RecoveryManager:
             if detected_markers:
                 print(f"    [CAMERA SUCCESS] {rv.name} fizycznie odczytał ArUco ID: {detected_markers}")
                 
-                # --- IDENTYFIKACJA ROŚLINY ---
-                target_plant_name = "Nieznana"
-                for plant in self.app.plants:
-                    dist = math.hypot(plant.pos[0] - rv.pos[0], plant.pos[1] - rv.pos[1])
-                    if dist <= 6.0 and plant.pos[1] > rv.pos[1] and abs(plant.pos[0] - rv.pos[0]) <= 2.0:
-                        target_plant_name = plant.name
-                        break
-                
-                # --- KLUCZOWA PĘTLA (Tutaj wywalało błąd!) ---
-                for marker_id in detected_markers:
+                for marker_id, (offset_x, offset_z) in detected_markers.items():
+                    matched_plant = None
+                    
+                    for plant in self.app.plants:
+                        if getattr(plant, 'aruco_id', None) == marker_id:
+                            matched_plant = plant
+                            break
+                    
+                    if matched_plant:
+                        target_plant_name = matched_plant.name
+                        
+                        # Wektor "w przód" (względem tego, jak obrócony jest łazik)
+                        forward_x = math.cos(rv.heading)
+                        forward_y = math.sin(rv.heading)
+                        
+                        # Wektor "w prawo" (obrót wektora w przód o 90 stopni / -pi/2)
+                        right_x = math.sin(rv.heading)
+                        right_y = -math.cos(rv.heading)
+                        
+                        # Rzutujemy lokalne odczyty z kamery na globalną mapę Coppelii
+                        plant_x = rv.pos[0] + (offset_z * forward_x) + (offset_x * right_x)
+                        plant_y = rv.pos[1] + (offset_z * forward_y) + (offset_x * right_y)
+                        # ------------------------------------------
+                        
+                        print(f"    [CV2 SUCCESS] Wykryto {target_plant_name} (Z: {offset_z:.2f}m przed łazikiem, X_boczne: {offset_x:.2f}m)")
+                        print(f"    -> Wyliczona idealna pozycja globalna: X: {plant_x:.2f}, Y: {plant_y:.2f}")
+                    else:
+                        # Fallback bezpieczeństwa, jeśli baza byłaby pusta
+                        target_plant_name = f"Nieznana (ArUco {marker_id})"
+                        
+                        plant_x = None
+                        plant_y = None
+                        print(f"    [MATCH WARNING] Wykryto ArUco {marker_id}, ale brak takiej rośliny w bazie danych!")
+
+                    # Zapis do mapy awaryjnej (jeśli jeszcze jej nie zapisano)
                     if marker_id not in self.app.emergency_map:
-                        # Na razie hardcodowane wartości (zmienimy je później)
-                        estimated_plant_x = rv.pos[0]
-                        estimated_plant_y = rv.pos[1] + 10.0
-                        
-                        # Zapis do mapy awaryjnej
-                        self.app.emergency_map[marker_id] = (estimated_plant_x, estimated_plant_y, target_plant_name)
-                        
-                        # Zapis do pamięci łazika pod kątem manewru geometrycznego
-                        self.last_plant_positions[rv.name] = [estimated_plant_x, estimated_plant_y]
-                # ---------------------------------------------
+                        self.app.emergency_map[marker_id] = (plant_x, plant_y, target_plant_name)
+                    
+                    # Zapisujemy IDEALNĄ pozycję do pamięci manewru geometrycznego 45 stopni!
+                    self.last_plant_positions[rv.name] = [plant_x, plant_y]
+                # --------------------------------------------
                         
             else:
                 print(f"    [CAMERA BLANK] {rv.name} patrzy, ale nie widzi markerów.")
@@ -361,6 +430,58 @@ class RecoveryManager:
                 rv.go_to(rv.pos[0], rv.pos[1], heading=math.pi / 2)
             
             self.app.root.after(1000, self._wait_for_maneuver)
+
+    def do_photo(self):
+        print("\n" + "=" * 70)
+        print("[PHOTO MODE] Capturing images from all deployed rovers...")
+        print("=" * 70)
+        
+        rovers = getattr(self.app, 'deployed_rovers', [])
+        
+        if not rovers:
+            print("[WARNING] Brak wdrożonych łazików! Najpierw wyślij flotę, by móc zrobić zdjęcia.")
+            rovers = getattr(self.app, 'rovers', [])
+            
+
+        for rv in rovers:
+            print(f"\n[DEBUG] ---> Start iteracji dla: {rv.name}")
+            print(f"[DEBUG] [{rv.name}] Czekam na dostęp do wątku (rv._class_lock)...")
+            
+            with rv._class_lock:
+                print(f"[DEBUG] [{rv.name}] Uzyskano dostęp do wątku! Wchodzę w try...")
+                try:
+                    camera_handle = getattr(rv, 'camera', None)
+                    print(f"[DEBUG] [{rv.name}] Odczytany uchwyt kamery: {camera_handle}")
+                    
+                    if camera_handle is None or camera_handle == -1:
+                        print(f"    [CAMERA LINK ERROR] {rv.name} nie posiada poprawnego uchwytu kamery!")
+                        continue
+                    
+                    print(f"[DEBUG] [{rv.name}] Wywołuję rv.sim.getVisionSensorImg... (Tutaj może się zawiesić)")
+                    image_bytes, resolution = rv.sim.getVisionSensorImg(camera_handle, 0)
+                    print(f"[DEBUG] [{rv.name}] Sukces API! Długość odebranego bufora: {len(image_bytes) if image_bytes else 'Brak'}")
+                    
+                    if not image_bytes or len(image_bytes) == 0:
+                        print(f"    [WARNING] Pusty bufor kamery dla {rv.name}.")
+                        continue
+
+                    print(f"[DEBUG] [{rv.name}] Rozpoczynam przetwarzanie obrazu numpy/OpenCV...")
+                    width, height = resolution[0], resolution[1]
+                    img = np.frombuffer(image_bytes, dtype=np.uint8)
+                    img.shape = (height, width, 3)
+                    
+                    img = cv2.flip(img, 0)
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+                    print(f"[DEBUG] [{rv.name}] Zapisuję plik na dysku...")
+                    cv2.imwrite(f"debug_{rv.name}.png", img)
+                    print(f"    -> Sukces! Zapisano: debug_{rv.name}.png")
+                    
+                except Exception as e:
+                    print(f"    [CAMERA ERROR] Błąd przetwarzania obrazu dla {rv.name}: {e}")
+                    continue
+            
+            print(f"[DEBUG] <--- Koniec iteracji dla: {rv.name}. Zwalniam locka.\n")
         
 
 

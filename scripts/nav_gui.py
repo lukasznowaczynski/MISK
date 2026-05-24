@@ -317,6 +317,7 @@ def detect_rovers(charging_stations: dict, base_pos=None) -> list:
 
 def detect_plants() -> list:
     plants = []
+    plant_index = 0
     for r in range(20):
         found_in_row = False
         for c in range(20):
@@ -325,10 +326,14 @@ def detect_plants() -> list:
                 with Rover._class_lock:
                     handle = sim.getObject(f'/{alias}')
                 p = Plant(sim=sim, handle=handle, name=alias)
+                
+                p.aruco_id = plant_index + 10
+                
                 plants.append(p)
+                plant_index += 1
                 found_in_row = True
-                print(f"Wykryto rosliny: {alias}")
-            except Exception:
+                print(f"Wykryto rosliny: {alias} [Przypisano ArUco: {p.aruco_id}]")
+            except Exception as e:
                 break
         if not found_in_row:
             break

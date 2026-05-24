@@ -44,6 +44,8 @@ class Plant:
         self._action_start   = None
         self._action_end     = None
 
+        self.aruco_id = None
+
         self.pos = [0.0, 0.0, 0.0]
         with Rover._class_lock:
             try:

@@ -119,12 +119,12 @@ class Rover:
 
             # create vision sensor
             cam = self.sim.createVisionSensor(
-                0,
-                [256, 256, 0, 0],
+                2,
+                [1024, 1024, 0, 0],
                 [
                     0.01,                 # near clipping
                     20.0,                 # far clipping
-                    math.radians(100),     # FOV
+                    math.radians(60),     # FOV
                     0.1,
                     0.0,
                     0.0,
