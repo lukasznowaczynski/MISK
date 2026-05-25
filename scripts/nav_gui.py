@@ -604,10 +604,15 @@ class NavApp:
 
         canv = tk.Canvas(plants_lf, width=420, height=CANVAS_SIZE,
                          bg="white", highlightthickness=0)
-        vsb  = tk.Scrollbar(plants_lf, orient="vertical", command=canv.yview)
-        canv.configure(yscrollcommand=vsb.set)
-        vsb.pack(side=tk.RIGHT, fill="y")
-        canv.pack(side=tk.LEFT, fill="both")
+        vsb  = tk.Scrollbar(plants_lf, orient="vertical",   command=canv.yview)
+        hsb  = tk.Scrollbar(plants_lf, orient="horizontal",  command=canv.xview)
+        canv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        plants_lf.grid_rowconfigure(0, weight=1)
+        plants_lf.grid_columnconfigure(0, weight=1)
+        canv.grid(row=0, column=0, sticky="nsew")
+        vsb.grid( row=0, column=1, sticky="ns")
+        hsb.grid( row=1, column=0, sticky="ew")
 
         inner = tk.Frame(canv, bg="white")
         canv.create_window((0, 0), window=inner, anchor="nw")
