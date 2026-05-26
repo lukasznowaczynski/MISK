@@ -158,17 +158,7 @@ class Rover:
 
             self.camera = cam
 
-        # with Rover._class_lock:
-        #     try:
-        #         # Szukamy kamery po jej absolutnej ścieżce widocznej na Twoim screenie.
-        #         # Np. dla rover_1 to będzie "/rover_1/VisionSensor"
-        #         sensor_path = f"/{self.name}/visionSensor"
-        #         self.camera = self.sim.getObject(sensor_path)
-                
-        #         print(f"[ROVER INIT] Sukces! Podpięto się pod gotowy obiektyw: {sensor_path}")
-        #     except Exception as e:
-        #         print(f"[ROVER INIT ERROR] Nie znaleziono 'VisionSensor' dla {self.name}: {e}")
-        #         self.camera = None
+
 
     # ── Setup ──────────────────────────────────────────────────────────────
 
