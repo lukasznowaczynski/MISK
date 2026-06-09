@@ -80,15 +80,37 @@ class RecoveryManager:
             print("=" * 60)
             
             # AUTOMATYCZNY START PROFILU RECOVERY MAPPING
-            self._deploy_scout()
+            self.state = "INIT"
+            self.action_in_progress = False
+            self._state_machine_loop()
         else:
             current_states = [f"{rv.name}:{rv.status}" for rv in self.app.rovers]
             print(f"[Monitor Parkowania]: Oczekiwanie... ({', '.join(current_states)})")
             self.app.root.after(1000, self._wait_for_base_arrival)
 
+
+    def _state_machine_loop(self):
+        if self.state == "INIT":
+            self._deploy_scout()
+        elif self.state == "DUAL_ADVANCE":
+            self._state_dual_advance()
+        elif self.state == "SPLIT_DIVERGE":
+            self._state_split_diverge()
+        elif self.state == "FIND_EDGES":    
+            self._state_find_edges()
+        elif self.state == "DEPLOY_FLEET":
+            self._state_find_dy()
+        elif self.state == "CORRIDOR_SCAN":
+            self._state_corridor_scan()
+        elif self.state == "CORR":
+            print("\n[SUKCES] Faza podwójnego zwiadu zakończona!")
+            return
+
+        self.app.root.after(300, self._state_machine_loop)
+
     def _deploy_scout(self):
         print("\n" + "=" * 60)
-        print("[SYSTEM] START MAPOWANIA: PODWÓJNY ZWIAD (STEREO WIZJA)")
+        print("[SYSTEM] START MAPOWANIA AWARYJNEGO")
         print("=" * 60)
 
         self.app.emergency_map = {}
@@ -97,30 +119,23 @@ class RecoveryManager:
         self.scout_A = self.app.rovers[0]  # Pojedzie docelowo w LEWO
         self.scout_B = self.app.rovers[1]  # Pojedzie docelowo w PRAWO
         
-        print(f"[ZWIAD] Rozkaz przydzielony: {self.scout_A.name} oraz {self.scout_B.name}")
-        
         self.state = "DUAL_ADVANCE"
         self.action_in_progress = False
-        self._state_machine_loop()
 
-    def _state_machine_loop(self):
-        if self.state == "DUAL_ADVANCE":
-            self._state_dual_advance()
-        elif self.state == "SPLIT_DIVERGE":
-            self._state_split_diverge()
-        elif self.state == "DONE":
-            print("\n[SUKCES] Faza podwójnego zwiadu zakończona!")
-            return
-
-        self.app.root.after(300, self._state_machine_loop)
-
-    def read_aruco_from_rover_camera(self, rv):
+    def read_aruco_from_rover_camera(self, rv, camera_name="front"):
         with rv._class_lock:
             try:
-                camera_handle = getattr(rv, 'camera', None)
-                if camera_handle is None or camera_handle == -1:
-                    print(f"[CAMERA LINK ERROR] {rv.name} nie posiada poprawnego uchwytu self.camera!")
-                    return []
+                if camera_name == "front":
+                    camera_handle = getattr(rv, 'camera', None) # Upewnij się, że główna kamera nazywa się rv.camera
+                    CAMERA_OFFSET = 0.75
+                elif camera_name == "left":
+                    camera_handle = getattr(rv, 'camera_left', None)
+                    CAMERA_OFFSET = 0.35
+                elif camera_name == "right":
+                    camera_handle = getattr(rv, 'camera_right', None)
+                    CAMERA_OFFSET = 0.35
+                else:
+                    return {}
                 
                 image_bytes, resolution = rv.sim.getVisionSensorImg(camera_handle, 0)
                 
@@ -152,7 +167,6 @@ class RecoveryManager:
                     # Wyliczenie ogniskowej z dynamicznych wartości
                     focal_length = cx / math.tan(fov_rad / 2.0)
 
-                    print(f"FOV_RAD: {fov_rad:.2f}, FOCAL_LENGTH: {focal_length:.2f}")
                     
                     camera_matrix = np.array([
                         [focal_length, 0, cx],
@@ -184,7 +198,7 @@ class RecoveryManager:
                             
                             # tvec[2][0] to odległość w linii prostej przed obiektywem.
                             # Dodajemy 0.75m, bo obiektyw wisi przed środkiem masy łazika!
-                            offset_z = tvec[2][0] + 0.75 
+                            offset_z = tvec[2][0] + CAMERA_OFFSET 
                             
                             # Zwracamy krotkę: (przesunięcie_boczne, odległość_na_wprost)
                             detected_data[marker_id] = (offset_x, offset_z)
@@ -194,10 +208,32 @@ class RecoveryManager:
             except Exception as e:
                 print(f"[CAMERA ERROR] Błąd przetwarzania obrazu dla {rv.name}: {e}")
                 return []
+            
+    def _local_to_global(self, rv, offset_x, offset_z, camera_name="front"):
+        """Przelicza offsety prosto z obiektywu na globalne współrzędne X, Y na mapie."""
+        
+        # 1. Ustalenie absolutnego kąta patrzenia kamery
+        if camera_name == "left":
+            cam_heading = rv.heading + (math.pi / 2.0)  # +90 stopni
+        elif camera_name == "right":
+            cam_heading = rv.heading - (math.pi / 2.0)  # -90 stopni
+        else: # front
+            cam_heading = rv.heading
+
+        # 2. Wektory kierunkowe
+        forward_x = math.cos(cam_heading)
+        forward_y = math.sin(cam_heading)
+        right_x = math.sin(cam_heading)
+        right_y = -math.cos(cam_heading)
+
+        # 3. Rzutowanie na globalną mapę Coppelii
+        g_x = rv.pos[0] + (offset_z * forward_x) + (offset_x * right_x)
+        g_y = rv.pos[1] + (offset_z * forward_y) + (offset_x * right_y)
+
+        return g_x, g_y
 
     def _state_dual_advance(self):
         if not self.action_in_progress:
-            print(f"[DUAL ZWIAD] Łaziki ruszają w pole. Każdy szuka swojego celu...")
             self.scout_A.go_to(self.scout_A.pos[0], self.scout_A.pos[1] + 50.0, heading=math.pi/2)
             self.scout_B.go_to(self.scout_B.pos[0], self.scout_B.pos[1] + 50.0, heading=math.pi/2)
             
@@ -212,25 +248,40 @@ class RecoveryManager:
             det_A = self.read_aruco_from_rover_camera(self.scout_A)
             if det_A:
                 marker_id, (offset_x, offset_y) = next(iter(det_A.items()))
-                self.scout_A.stop()
-                
-                # Zapisujemy dane do tej samej zmiennej, którą sprawdzaliśmy wyżej
-                self.scout_A_plant_pos = (marker_id, self.scout_A.pos[0] + offset_x, self.scout_A.pos[1] + offset_y)
-                print(f"[ZWIAD A] {self.scout_A.name} wykrył roślinę, ID: {marker_id} (X={self.scout_A_plant_pos[1]:.2f}, Y={self.scout_A_plant_pos[2]:.2f})")
+                print(f"Offset Y dla Scout A: {offset_y:.2f} m")
+                if offset_y <= 15.0:
+                    self.scout_A.stop()
+
+                    g_x = self.scout_A.pos[0] + offset_x
+                    g_y = self.scout_A.pos[1] + offset_y
+                    
+                    # Zapisujemy dane do tej samej zmiennej, którą sprawdzaliśmy wyżej
+                    self.scout_A_plant_pos = (marker_id, self.scout_A.pos[0] + offset_x, self.scout_A.pos[1] + offset_y)
+                    print(f"[ZWIAD A] {self.scout_A.name} wykrył roślinę, ID: {marker_id} (X={self.scout_A_plant_pos[1]:.2f}, Y={self.scout_A_plant_pos[2]:.2f})")
+                    if marker_id not in self.app.emergency_map:
+                        self.app.emergency_map[marker_id] = (g_x, g_y)
+                        print(f"[MAPA] Zarejestrowano pierwszą roślinę (ID={marker_id}) w bazie danych.")
 
         # Analogicznie dla Scout B
         if not self.scout_B_plant_pos:
             det_B = self.read_aruco_from_rover_camera(self.scout_B)
             if det_B:
                 marker_id, (offset_x, offset_y) = next(iter(det_B.items()))
-                self.scout_B.stop()
-                
-                self.scout_B_plant_pos = (marker_id, self.scout_B.pos[0] + offset_x, self.scout_B.pos[1] + offset_y)
-                print(f"[ZWIAD B] {self.scout_B.name} wykrył roślinę, ID: {marker_id} (X={self.scout_B_plant_pos[1]:.2f}, Y={self.scout_B_plant_pos[2]:.2f})")
+                print(f"Offset Y dla Scout B: {offset_y:.2f} m")
+                if offset_y <= 15.0:
+                    self.scout_B.stop()
+
+                    g_x = self.scout_B.pos[0] + offset_x
+                    g_y = self.scout_B.pos[1] + offset_y
+                    
+                    self.scout_B_plant_pos = (marker_id, self.scout_B.pos[0] + offset_x, self.scout_B.pos[1] + offset_y)
+                    print(f"[ZWIAD B] {self.scout_B.name} wykrył roślinę, ID: {marker_id} (X={self.scout_B_plant_pos[1]:.2f}, Y={self.scout_B_plant_pos[2]:.2f})")
+                    if marker_id not in self.app.emergency_map:
+                        self.app.emergency_map[marker_id] = (g_x, g_y)
+                        print(f"[MAPA] Zarejestrowano pierwszą roślinę (ID={marker_id}) w bazie danych.")
 
         # 3. Odwołujemy się do zmiennych RecoveryManagera, bez kropki po scout_A
         if self.scout_A_plant_pos and self.scout_B_plant_pos:
-            print("\n[STATUS] Oba łaziki na pozycjach. Przechodzimy do ustalenia DX.")
             self.action_in_progress = False
             self.state = "SPLIT_DIVERGE"
 
@@ -247,399 +298,409 @@ class RecoveryManager:
             self.scout_A_current_x = self.scout_A_plant_pos[1]
             self.scout_B_current_x = self.scout_B_plant_pos[1]
             self.search_dx_active = True
-            
-            print("\n[DUAL ZWIAD] Łaziki rozpoczynają żabie skoki na boki, aby ustalić DX...")
 
-        # --- LOGIKA DLA ŁAZIKA A (Skacze w LEWO) ---
+            self.scout_A_blank_seen = False
+            self.scout_B_blank_seen = False
+            
+
+        # --- LOGIKA DLA ŁAZIKA A (Jedzie w LEWO / na Zachód, patrzy PRAWĄ kamerą) ---
         if self.dx_A is None and self.search_dx_active:
             if not self.scout_A_hopping:
                 target_x = self.scout_A.pos[0] - self.hop_dist
-                self.scout_A.go_to(target_x, self.scout_A.pos[1], heading=math.pi/2)
+                self.scout_A.go_to(target_x, self.scout_A.pos[1], heading=math.pi)
                 self.scout_A_hopping = True
             
             elif self.scout_A.status != "moving":
-                det_A = self.read_aruco_from_rover_camera(self.scout_A)
+                det_A = self.read_aruco_from_rover_camera(self.scout_A, camera_name="right")
                 if det_A:
-                    for marker_id, (g_x, g_y) in det_A.items():
+                    for marker_id, (offset_x, offset_z) in det_A.items():
                         if marker_id != self.scout_A_plant_pos[0]:
-                            curr_plant_pos = (self.scout_A.pos[0] + g_x, self.scout_A.pos[1] + g_y)
-                            self.dx_A = abs(curr_plant_pos[0] - self.scout_A_plant_pos[1])
-                            self.scout_A_current_x = curr_plant_pos[0] 
-                            print(f"[DX ZNALEZIONE] Scout A ({self.scout_A.name}) zmierzył odstęp: {self.dx_A:.2f} m")
+                            
+                            # MAGIA TUTAJ: Tłumaczymy offsety kamery na mapę globalną!
+                            g_x, g_y = self._local_to_global(self.scout_A, offset_x, offset_z, "right")
+                            if marker_id not in self.app.emergency_map:
+                                self.app.emergency_map[marker_id] = (g_x, g_y)
+                                print(f"[MAPA] Dodano roślinę ID: {marker_id} na pozycji (X: {g_x:.2f}, Y: {g_y:.2f})")
+                                
+                            self.dx_A = abs(g_x - self.scout_A_plant_pos[1])
+                            self.scout_A_current_x = g_x 
+                            print(f"[DX ZNALEZIONE] Scout A zmierzył odstęp: {self.dx_A:.2f} m")
                             break
+                else:
+                    self.scout_A_blank_seen = True
                 
                 if self.dx_A is None:
                     self.scout_A_hopping = False
 
-        # --- LOGIKA DLA ŁAZIKA B (Skacze w PRAWO) ---
+        # --- LOGIKA DLA ŁAZIKA B (Jedzie w PRAWO / na Wschód, patrzy LEWĄ kamerą) ---
         if self.dx_B is None and self.search_dx_active:
             if not self.scout_B_hopping:
                 target_x = self.scout_B.pos[0] + self.hop_dist
-                self.scout_B.go_to_square(target_x, self.scout_B.pos[1], heading=math.pi/2)
+                self.scout_B.go_to(target_x, self.scout_B.pos[1], heading=0.0)
                 self.scout_B_hopping = True
             
             elif self.scout_B.status != "moving":
-                det_B = self.read_aruco_from_rover_camera(self.scout_B)
+                det_B = self.read_aruco_from_rover_camera(self.scout_B, camera_name="left")
                 if det_B:
-                    for marker_id, (g_x, g_y) in det_B.items():
+                    for marker_id, (offset_x, offset_z) in det_B.items():
                         if marker_id != self.scout_B_plant_pos[0]:
-                            curr_plant_pos = (self.scout_B.pos[0] + g_x, self.scout_B.pos[1] + g_y)
-                            self.dx_B = abs(curr_plant_pos[0] - self.scout_B_plant_pos[1])
-                            self.scout_B_current_x = curr_plant_pos[0]
-                            print(f"[DX ZNALEZIONE] Scout B ({self.scout_B.name}) zmierzył odstęp: {self.dx_B:.2f} m")
+                            
+                            # MAGIA TUTAJ: Tłumaczymy offsety kamery na mapę globalną!
+                            g_x, g_y = self._local_to_global(self.scout_B, offset_x, offset_z, "left")
+                            
+                            if marker_id not in self.app.emergency_map:
+                                self.app.emergency_map[marker_id] = (g_x, g_y)
+                                print(f"[MAPA] Dodano roślinę ID: {marker_id} na pozycji (X: {g_x:.2f}, Y: {g_y:.2f})")
+                             
+                            self.dx_B = abs(g_x - self.scout_B_plant_pos[1])
+                            self.scout_B_current_x = g_x
+                            print(f"[DX ZNALEZIONE] Scout B zmierzył odstęp: {self.dx_B:.2f} m")
                             break
+                else:
+                    self.scout_B_blank_seen = True
                 
                 if self.dx_B is None:
                     self.scout_B_hopping = False
 
-        # --- KONSENSUS LUB RATUNEK ---
-        # Wystarczy, że TYLKO JEDEN łazik znajdzie DX!
+        # --- KONSENSUS LUB RATUNEK (INTELIGENTNE WNIOSKOWANIE O KRAWĘDZIACH) ---
         if self.dx_A is not None or self.dx_B is not None:
+            self.search_dx_active = False 
             
-            self.search_dx_active = False # Blokujemy kolejne skoki w tym stanie
+            # Domyślnie zakładamy, że oba muszą w kolejnym etapie szukać krawędzi...
+            self.scout_A_searching = True
+            self.scout_B_searching = True
             
             if self.dx_A is not None and self.dx_B is not None:
-                # Obydwa znalazły jednocześnie
                 self.grid_dx = (self.dx_A + self.dx_B) / 2.0
                 print(f"\n[SUKCES] OBA łaziki znalazły DX. Średnia = {self.grid_dx:.2f} m")
                 
             elif self.dx_A is not None:
-                # Tylko A znalazł
                 self.grid_dx = self.dx_A
-                self.scout_B.stop()  # Zatrzymujemy B! (Żeby nie skakał dalej w puste pole)
-                print(f"\n[SUKCES] Scout A znalazł DX = {self.grid_dx:.2f} m. Zatrzymuję zgubionego Scouta B!")
+                self.scout_B.stop() 
+                
+                # ...chyba że wdrożymy nasze inteligentne wnioskowanie dla B!
+                if self.scout_B_blank_seen:
+                    self.x_max = self.scout_B_plant_pos[1]
+                    self.scout_B_searching = False 
                 
             elif self.dx_B is not None:
-                # Tylko B znalazł
                 self.grid_dx = self.dx_B
-                self.scout_A.stop()  # Zatrzymujemy A!
-                print(f"\n[SUKCES] Scout B znalazł DX = {self.grid_dx:.2f} m. Zatrzymuję zgubionego Scouta A!")
+                self.scout_A.stop() 
+                
+                # ...chyba że wdrożymy nasze inteligentne wnioskowanie dla A!
+                if self.scout_A_blank_seen:
+                    self.x_min = self.scout_A_plant_pos[1]
+                    self.scout_A_searching = False 
 
             print("=" * 60)
             
-            # Przechodzimy do rozjazdu
             self.action_in_progress = False
-            self.scout_A_searching = True
-            self.scout_B_searching = True
             
-            # Sprzątamy zmienne pomocnicze przed zmianą stanu
+            # Czyszczenie pamięci tymczasowej przed przejściem dalej
             del self.dx_A
             del self.dx_B
             del self.search_dx_active
             
-            self.state = "SPLIT_DIVERGE"
-
-    def _state_find_dx(self):
-        """STAN 2: Skok w prawo, aby poznać szerokość alejki (DX)."""
-        if not self.action_in_progress:
-            print(f"[ZWIAD] Badanie odstępu poziomego (DX)...")
-            self.scout.go_to(self.anchor_pos[0] - (self.anchor_pos[1] - self.scout.pos[1]), self.scout.pos[1], heading=math.pi/2)
-            self.action_in_progress = True
-
-        if self.scout.status != "moving":
-            detected = self.read_aruco_from_rover_camera(self.scout)
-            for marker_id, (offset_x, offset_y) in detected.items():
-                if marker_id != self.anchor_id:
-                    self.scout.stop()
-
-                    new_anchor_pos = (self.scout.pos[0] + offset_x, self.scout.pos[1] + offset_y)
-                    self.grid_dx = abs(new_anchor_pos[0] - self.anchor_pos[0])
-                    print(f"[SUKCES] Ustalono DX = {self.grid_dx:.2f} m")
-                    
-                    self.action_in_progress = False
-                    self.current_edge_x = self.anchor_pos[0]
-                    self.state = "FIND_REAL_ANCHOR"
-                    return
-                
-    def _state_find_real_anchor(self):
-        """STAN 3: Skoki w lewo o równe DX, aby znaleźć skrajną lewą roślinę (Prawdziwą Kotwicę)."""
-
-        if not self.action_in_progress:
-            # Planujemy skok w lewo o jedną alejkę
-            target_x = self.current_edge_x - self.grid_dx
-            print(f"[ZWIAD] Szukanie lewej krawędzi. Skok na pozycję X: {target_x:.2f} m...")
+            # Odpalenie stanu rozjazdu do brzegów pola!
+            self.state = "FIND_EDGES"
             
-            # Jedziemy na nową pozycję po osi X, obracając kamerę z powrotem na Północ
-            self.scout.go_to(target_x, self.scout.pos[1], heading=math.pi/2)
-            self.action_in_progress = True
 
-        # Gdy łazik dojedzie na miejsce i się zatrzyma
-        if self.scout.status != "moving":
-            detected = self.read_aruco_from_rover_camera(self.scout)
-            
-            if detected:
-                # Widzimy roślinę! Czyli to wciąż nie jest koniec pola
-                marker_id, (offset_x, offset_y) = next(iter(detected.items()))
-                
-                self.scout.stop()
-                
-                # Obliczamy i aktualizujemy nową lewą krawędź
-                new_edge_pos = (self.scout.pos[0] + offset_x, self.scout.pos[1] + offset_y)
-                self.current_edge_x = new_edge_pos[0]
-                self.anchor_id = marker_id
-                
-                print(f" -> Znaleziono kolejną roślinę w lewo (ID: {marker_id}). Skaczemy dalej.")
-                
-                # Odblokowujemy flagę akcji – w kolejnym cyklu łazik skoczy znowu
-                self.action_in_progress = False
-                
-            else:
-                # KAMERA JEST PUSTA! Nie ma rośliny.
-                # Oznacza to, że skoczyliśmy poza pole. Ostatnia znana pozycja to krawędź.
-                self.scout.stop()
-                
-                # Przypisujemy prawdziwą skrajną lewą krawędź (Origin X)
-                self.x_min = self.current_edge_x
-                
-                # Aktualizujemy Kotwicę, aby na niej bazował stan FIND_DY
-                self.anchor_pos = (self.x_min, self.anchor_pos[1])
-                
-                print("\n" + "*" * 50)
-                print(f"[KRAWĘDŹ ZNALEZIONA] Skrajny lewy rząd to X: {self.x_min:.2f} m")
-                print("*" * 50)
-                
-                self.action_in_progress = False
-                self.state = "FIND_DY"
-
-    def scan_row_markers(self, current_index=0):
-        if current_index == 0:
-            print("\n" + "=" * 70)
-            print(f"[RECOVERY] READING MARKERS FOR ROW {getattr(self, 'current_scan_row', 0)}")
-            print("=" * 70)
+    def _state_find_edges(self):
+        """STAN 3: Szukanie skrajnych krawędzi pola. Łaziki skaczą w boki o pełne grid_dx."""
         
-        # Warunek stopu: wszystkie łaziki w aktualnym rzędzie odpytane
-        if current_index >= len(getattr(self.app, 'deployed_rovers', [])):
-            print("\n" + "-" * 70)
-            print(f" STAN MAPY AWARYJNEJ (PO RZĘDZIE {getattr(self, 'current_scan_row', 0)}):")
-            print("-" * 70)
-            if not getattr(self.app, 'emergency_map', {}):
-                print(" [EMPTY] No coordinates saved yet.")
-            else:
-                for marker_id, data in self.app.emergency_map.items():
-                    plant_name = data[2]
-                    x_coord = data[0]
-                    y_coord = data[1]
-                    print(f" > Roślina: {plant_name:12} | ArUco ID: {marker_id:3} | X= {x_coord:6.2f}, Y= {y_coord:6.2f}")
-            print("-" * 70)
-            print("=" * 70 + "\n")
-
-            # ODPALAMY SKOK DO KOLEJNEGO RZĘDU
-            self.move_next_row()
+        # Jeśli OBA łaziki znalazły swoje krawędzie - KONIEC ZWIADU
+        if not getattr(self, 'scout_A_searching', True) and not getattr(self, 'scout_B_searching', True):
+            print("\n" + "=" * 60)
+            print("[SUKCES FULL] Wymiary pola poziome zmapowane!")
+            print(f" -> Skrajnie lewy rząd:  X = {self.x_min:.2f} m")
+            print(f" -> Skrajnie prawy rząd: X = {self.x_max:.2f} m")
+            print(f" -> Szerokość alejek:    DX = {self.grid_dx:.2f} m")
+            print("=" * 60)
+            
+            self.action_in_progress = False
+            self.state = "DEPLOY_FLEET" 
             return
 
-        rv = self.app.deployed_rovers[current_index]
-        
-        if rv.status in ("arrived", "idle"):
-            print(f" -> [{rv.name}] aktywacja kamery do skanowania wizyjnego...")
-            
-            detected_markers = self.read_aruco_from_rover_camera(rv)
-            
-            if detected_markers:
-                print(f"    [CAMERA SUCCESS] {rv.name} fizycznie odczytał ArUco ID: {detected_markers}")
+        # Jeśli łaziki nie są w trakcie ruchu, planujemy kolejny skok
+        if not self.action_in_progress:
+            # Skok łazika A (w lewo o pełne grid_dx)
+            if self.scout_A_searching:
+                target_A_x = self.scout_A_current_x - self.grid_dx
+                # print(f"[EDGES] Scout A skok LEWO na X: {target_A_x:.2f} m")
+                self.scout_A.go_to(target_A_x, self.scout_A.pos[1], heading=math.pi)
                 
-                for marker_id, (offset_x, offset_z) in detected_markers.items():
-                    matched_plant = None
-                    
-                    for plant in self.app.plants:
-                        if getattr(plant, 'aruco_id', None) == marker_id:
-                            matched_plant = plant
-                            break
-                    
-                    if matched_plant:
-                        target_plant_name = matched_plant.name
-                        
-                        # Wektor "w przód" (względem tego, jak obrócony jest łazik)
-                        forward_x = math.cos(rv.heading)
-                        forward_y = math.sin(rv.heading)
-                        
-                        # Wektor "w prawo" (obrót wektora w przód o 90 stopni / -pi/2)
-                        right_x = math.sin(rv.heading)
-                        right_y = -math.cos(rv.heading)
-                        
-                        # Rzutujemy lokalne odczyty z kamery na globalną mapę Coppelii
-                        plant_x = rv.pos[0] + (offset_z * forward_x) + (offset_x * right_x)
-                        plant_y = rv.pos[1] + (offset_z * forward_y) + (offset_x * right_y)
-                        # ------------------------------------------
-                        
-                        print(f"    [CV2 SUCCESS] Wykryto {target_plant_name} (Z: {offset_z:.2f}m przed łazikiem, X_boczne: {offset_x:.2f}m)")
-                        print(f"    -> Wyliczona idealna pozycja globalna: X: {plant_x:.2f}, Y: {plant_y:.2f}")
-                    else:
-                        # Fallback bezpieczeństwa, jeśli baza byłaby pusta
-                        target_plant_name = f"Nieznana (ArUco {marker_id})"
-                        
-                        plant_x = None
-                        plant_y = None
-                        print(f"    [MATCH WARNING] Wykryto ArUco {marker_id}, ale brak takiej rośliny w bazie danych!")
+            # Skok łazika B (w prawo o pełne grid_dx)
+            if self.scout_B_searching:
+                target_B_x = self.scout_B_current_x + self.grid_dx
+                # print(f"[EDGES] Scout B skok PRAWO na X: {target_B_x:.2f} m")
+                self.scout_B.go_to(target_B_x, self.scout_B.pos[1], heading=0.0)
+                
+            self.action_in_progress = True
 
-                    # Zapis do mapy awaryjnej (jeśli jeszcze jej nie zapisano)
+        # Sprawdzamy status ruchu (czy łaziki już dojechały na miejsce)
+        wait_for_A = self.scout_A_searching and self.scout_A.status == "moving"
+        wait_for_B = self.scout_B_searching and self.scout_B.status == "moving"
+
+        # Kiedy łaziki wcisną hamulec po skoku:
+        if not wait_for_A and not wait_for_B:
+            
+            # --- Sprawdzamy Scout A (Kamera Prawa) ---
+            if self.scout_A_searching:
+                det_A = self.read_aruco_from_rover_camera(self.scout_A, "right")
+                if det_A:
+                    # Znaleziono roślinę - aktualizujemy krawędź i przygotowujemy się do kolejnego skoku
+                    marker_id, (offset_x, offset_z) = next(iter(det_A.items()))
+
+
+                    g_x, g_y = self._local_to_global(self.scout_A, offset_x, offset_z, "right")
                     if marker_id not in self.app.emergency_map:
-                        self.app.emergency_map[marker_id] = (plant_x, plant_y, target_plant_name)
-                    
-                    # Zapisujemy IDEALNĄ pozycję do pamięci manewru geometrycznego 45 stopni!
-                    self.last_plant_positions[rv.name] = [plant_x, plant_y]
-                # --------------------------------------------
-                        
-            else:
-                print(f"    [CAMERA BLANK] {rv.name} patrzy, ale nie widzi markerów.")
-
-        self.app.root.after(500, lambda: self.scan_row_markers(current_index + 1))
-
-    def _wait_for_maneuver(self):
-        """Pętla czekająca na fizyczny dojazd wszystkich łazików w danym etapie."""
-        all_arrived = True
-        for rv in self.app.deployed_rovers:
-            # Dopóki robot jest w stanie "moving", flaga jest False
-            if rv.status not in ("arrived", "idle"):
-                all_arrived = False
-                break
-                
-        if all_arrived:
-            if self.maneuver_stage == 4:
-                # Kiedy łaziki wyrównają kamery (krok 4), wracamy do pętli skanowania
-                self.scan_row_markers()
-            else:
-                # Jeśli to krok 1, 2 lub 3 -> przechodzimy do kolejnego kroku
-                self.maneuver_stage += 1
-                self._execute_maneuver_stage()
-        else:
-            # Jeśli wciąż jadą, sprawdź ponownie za pół sekundy
-            self.app.root.after(500, self._wait_for_maneuver)
-
-    def move_next_row(self):
-        """Rozpoczyna manewr wyprzedzania z podziałem na etapy, by uniknąć nadpisywania komend."""
-        self.current_scan_row += 1
-
-        # Upewnij się, że masz ustawione self.MAX_ROWS w __init__
-        if self.current_scan_row > getattr(self, 'MAX_ROWS', 4):
-            print("\n" + "*" * 70)
-            print("[MISSION COMPLETE] Flota zbadala wszystkie rzędy. Mapa awaryjna jest pełna!")
-            print("*" * 70 + "\n")
-            return
-
-        print("\n" + "=" * 70)
-        print(f"[SYSTEM] Omijanie przeszkody i jazda do RZĘDU {self.current_scan_row}...")
-        print("=" * 70)
-        
-        # Jeśli nie masz tego w __init__, inicjalizujemy słownik do trzymania offsetów
-        if not hasattr(self, 'rover_offsets'):
-            self.rover_offsets = {}
-
-        self.maneuver_stage = 1
-        self._execute_maneuver_stage()
-
-    def _execute_maneuver_stage(self):
-        """Zarządza kolejnymi krokami geometrycznymi. Pomiędzy krokami system czeka na dojazd."""
-        
-        if self.maneuver_stage == 1:
-            print("[MANEWR 1/4] Odjazd w prawo (Wyliczanie kąta 45 stopni)")
-            for rv in self.app.deployed_rovers:
-                # Zapisujemy pas startowy przed ruchem
-                self.lane_x_positions[rv.name] = rv.pos[0]
-                plant_pos = self.last_plant_positions.get(rv.name)
-                
-                if plant_pos:
-                    dist_to_plant = abs(plant_pos[1] - rv.pos[1])
-                    offset_x = dist_to_plant
+                        self.app.emergency_map[marker_id] = (g_x, g_y)
+                        print(f"[MAPA] Dodano roślinę ID: {marker_id} na pozycji (X: {g_x:.2f}, Y: {g_y:.2f})")
+                    self.scout_A_current_x = g_x
+                    # print(f" -> Scout A (ID: {marker_id}). Skaczę dalej w lewo.")
+                    self.action_in_progress = False 
                 else:
-                    print(f"    [WARNING] Brak danych o rośliny dla {rv.name}! Zakładam offset 2m.")
-                    offset_x = 2.0
-                
-                # Zapisujemy wyliczony offset dla tego łazika, by użyć go w kroku 2!
-                self.rover_offsets[rv.name] = offset_x
-                
-                target_x = rv.pos[0] + offset_x
-                print(f"    -> [{rv.name}] Odjeżdżam {offset_x:.2f}m w prawo.")
-                # heading=0.0 -> wschód
-                rv.go_to(target_x, rv.pos[1], heading=0.0)
-                
-            # Po wydaniu komend, czekamy aż łaziki tam dojadą!
-            self.app.root.after(1000, self._wait_for_maneuver)
+                    self.x_min = self.scout_A_current_x
+                    self.scout_A_searching = False
+                    
+                    # POWRÓT NA KRAWĘDŹ:
+                    # print(f" -> Pusto! Wracam na X_min: {self.x_min:.2f}")
+                    self.scout_A.go_to(self.x_min, self.scout_A.pos[1], heading=math.pi)
+                    
+                    self.scout_A.stop()
+                    # print(f"\n[*] Scout A ustawił się na LEWEJ krawędzi pola.")
+                    self.action_in_progress = False
 
-        elif self.maneuver_stage == 2:
-            print("[MANEWR 2/4] Jazda w górę pola")
-            for rv in self.app.deployed_rovers:
-                # Odzyskujemy wyliczony wcześniej offset
-                offset_x = self.rover_offsets.get(rv.name, 2.0)
-                
-                # Używamy Twojej matematyki: 2 * offset_x
-                target_y = rv.pos[1] + (2 * offset_x)
-                print(f"    -> [{rv.name}] Odjeżdżam {2*offset_x:.2f}m w górę.")
-                # heading=math.pi/2 -> północ
-                rv.go_to(rv.pos[0], target_y, heading=math.pi / 2)
-                
-            self.app.root.after(1000, self._wait_for_maneuver)
+            # --- Sprawdzamy Scout B (Kamera Lewa) ---
+            if self.scout_B_searching:
+                det_B = self.read_aruco_from_rover_camera(self.scout_B, "left")
+                if det_B:
+                    # Znaleziono roślinę - aktualizujemy krawędź i przygotowujemy się do kolejnego skoku
+                    marker_id, (offset_x, offset_z) = next(iter(det_B.items()))
+                    g_x, g_y = self._local_to_global(self.scout_B, offset_x, offset_z, "left")
+                    if marker_id not in self.app.emergency_map:
+                        self.app.emergency_map[marker_id] = (g_x, g_y)
+                        print(f"[MAPA] Dodano roślinę ID: {marker_id} na pozycji (X: {g_x:.2f}, Y: {g_y:.2f})")
+                    self.scout_B_current_x = g_x
+                    # print(f" -> Scout B (ID: {marker_id}). Skaczę dalej w prawo.")
+                    self.action_in_progress = False 
+                else:
+                    # Pusto! Prawa krawędź ustrzelona. Cofamy łazika do ostatniej dobrej pozycji!
+                    self.x_max = self.scout_B_current_x
+                    self.scout_B_searching = False
+                    
+                    # POWRÓT NA KRAWĘDŹ:
+                    # print(f" -> Pusto! Wracam na X_max: {self.x_max:.2f}")
+                    self.scout_B.go_to(self.x_max, self.scout_B.pos[1], heading=0.0)
+                    
+                    self.scout_B.stop()
+                    # print(f"\n[*] Scout B ustawił się na PRAWEJ krawędzi pola.")
+                    self.action_in_progress = False
 
-        elif self.maneuver_stage == 3:
-            print("[MANEWR 3/4] Powrót w lewo na główny pas ruchu")
-            for rv in self.app.deployed_rovers:
-                # Wracamy bezpiecznie do zapisanego na samym początku X z pasa ruchu
-                target_x = self.lane_x_positions.get(rv.name, rv.pos[0] - 2.0)
-                print(f"    -> [{rv.name}] Wracam na pas {target_x:.2f} na osi X.")
-                # heading=math.pi -> zachód
-                rv.go_to(target_x, rv.pos[1], heading=math.pi)
-                
-            self.app.root.after(1000, self._wait_for_maneuver)
 
-        elif self.maneuver_stage == 4:
-            print("[MANEWR 4/4] Wyrównanie kamer na wprost przed nowym rzędem!")
-            for rv in self.app.deployed_rovers:
-                # Tylko obrót na północ
-                rv.go_to(rv.pos[0], rv.pos[1], heading=math.pi / 2)
-            
-            self.app.root.after(1000, self._wait_for_maneuver)
-
-    def do_photo(self):
-        print("\n" + "=" * 70)
-        print("[PHOTO MODE] Capturing images from all deployed rovers...")
-        print("=" * 70)
+    def _state_find_dy(self):
+        """STAN: Empiryczne sondowanie pionowego rozstawu rzędów (DY) metodą skokową."""
         
-        rovers = getattr(self.app, 'deployed_rovers', [])
-        
-        if not rovers:
-            print("[WARNING] Brak wdrożonych łazików! Najpierw wyślij flotę, by móc zrobić zdjęcia.")
-            rovers = getattr(self.app, 'rovers', [])
+        # --- 1. INICJALIZACJA ZMIENNYCH DLA SONDOWANIA ---
+        if not hasattr(self, 'dy_hopping'):
+            print("\n[PROBE_DY] Rozpoczynam procedurę sondowania pionowego...")
+            self.dy_hopping = False
+            self.dy_hop_dist = 2.0  # Długość jednego skoku sondy w głąb pola
+            self.dy_probing_active = True
+            self.action_in_progress = True
             
+            # NOWOŚĆ: Flaga sprawdzająca, czy łazik ustawił się już w nowym korytarzu
+            self.dy_aligned = False 
 
-        for rv in rovers:
-            print(f"\n[DEBUG] ---> Start iteracji dla: {rv.name}")
-            print(f"[DEBUG] [{rv.name}] Czekam na dostęp do wątku (rv._class_lock)...")
+        # --- 1B. ETAP DOPASOWANIA: ODJAZD O 5M W LEWO OD ROŚLINY ID 10 ---
+        if self.dy_probing_active and not self.dy_aligned:
+            if not hasattr(self, 'dy_aligning_started'):
+                # Sprawdzamy, czy roślina o ID 10 została już zapisana w naszej mapie offline
+                if 10 in self.app.emergency_map:
+                    plant_10_x, plant_10_y = self.app.emergency_map[10]
+                    
+                    # Obliczamy pozycję korytarza: 5 metrów na lewo od linii rośliny ID 10
+                    target_x = plant_10_x - 5.0 
+                    
+                    # print(f"[ALIGN] Zjeżdżam do korytarza obok. Cel X: {target_x:.2f} m (5m w lewo od ID 10)")
+                    
+                    # Wysyłamy łazika na nowy X. Zostawiamy obecny Y. 
+                    # Od razu ustawiamy heading=math.pi/2, żeby po dojechaniu stał przodem do kierunku jazdy (Północ).
+                    self.scout_A.go_to(target_x, self.scout_A.pos[1], heading=self.scout_A.heading)
+                    self.dy_aligning_started = True
+                else:
+                    # print("[WARN] Brak rośliny o ID 10 w pamięci mapy! Pomijam wyrównanie boczne.")
+                    self.dy_aligned = True
             
-            with rv._class_lock:
-                print(f"[DEBUG] [{rv.name}] Uzyskano dostęp do wątku! Wchodzę w try...")
-                try:
-                    camera_handle = getattr(rv, 'camera', None)
-                    print(f"[DEBUG] [{rv.name}] Odczytany uchwyt kamery: {camera_handle}")
-                    
-                    if camera_handle is None or camera_handle == -1:
-                        print(f"    [CAMERA LINK ERROR] {rv.name} nie posiada poprawnego uchwytu kamery!")
-                        continue
-                    
-                    print(f"[DEBUG] [{rv.name}] Wywołuję rv.sim.getVisionSensorImg... (Tutaj może się zawiesić)")
-                    image_bytes, resolution = rv.sim.getVisionSensorImg(camera_handle, 0)
-                    print(f"[DEBUG] [{rv.name}] Sukces API! Długość odebranego bufora: {len(image_bytes) if image_bytes else 'Brak'}")
-                    
-                    if not image_bytes or len(image_bytes) == 0:
-                        print(f"    [WARNING] Pusty bufor kamery dla {rv.name}.")
-                        continue
-
-                    print(f"[DEBUG] [{rv.name}] Rozpoczynam przetwarzanie obrazu numpy/OpenCV...")
-                    width, height = resolution[0], resolution[1]
-                    img = np.frombuffer(image_bytes, dtype=np.uint8)
-                    img.shape = (height, width, 3)
-                    
-                    img = cv2.flip(img, 0)
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-                    print(f"[DEBUG] [{rv.name}] Zapisuję plik na dysku...")
-                    cv2.imwrite(f"debug_{rv.name}.png", img)
-                    print(f"    -> Sukces! Zapisano: debug_{rv.name}.png")
-                    
-                except Exception as e:
-                    print(f"    [CAMERA ERROR] Błąd przetwarzania obrazu dla {rv.name}: {e}")
-                    continue
+            # Czekamy, aż łazik zakończy fizyczny dojazd w bok do nowego korytarza
+            elif self.scout_A.status != "moving":
+                # print("[ALIGN] Łazik zaparkował w lewym korytarzu. Rozpoczynam skoki w głąb pola.")
+                self.dy_aligned = True
+                del self.dy_aligning_started
             
-            print(f"[DEBUG] <--- Koniec iteracji dla: {rv.name}. Zwalniam locka.\n")
-        
+            # Przerywamy bieżący obieg pętli i czekamy na kolejny (aż skończy jechać w bok)
+            return 
 
+        # --- 2. LOGIKA SKOKOWA DLA ŁAZIKA A (Uruchamia się DOPIERO po ustawieniu w korytarzu) ---
+        if self.dy_probing_active and self.dy_aligned:
+            
+            # Krok A: Jeśli nie wykonuje skoku, zlecamy ruch do przodu
+            if not self.dy_hopping:
+                target_y = self.scout_A.pos[1] + self.dy_hop_dist
+                # print(f"[PROBE_DY] Skok w głąb pola na Y: {target_y:.2f} m")
+                
+                # heading=math.pi/2 to obrót na "Północ" (wzdłuż osi Y)
+                self.scout_A.go_to(self.scout_A.pos[0], target_y, heading=math.pi/2)
+                self.dy_hopping = True
+                
+            # Krok B: Jeśli łazik zahamował po skoku, odczytujemy kamerę
+            elif self.scout_A.status != "moving":
+                det = self.read_aruco_from_rover_camera(self.scout_A, camera_name="front")
+                
+                if det:
+                    for marker_id, (offset_x, offset_z) in det.items():
+                        # Szukamy INNEGO id niż to, przy którym wystartowaliśmy
+                        if marker_id != self.scout_A_plant_pos[0]:
+                            
+                            print(f"\n[DETECTION] {self.scout_A.name} wykrył NOWY marker (ID: {marker_id}).")
+                            
+                            # Przeliczamy na globalne Y
+                            g_x, g_y = self._local_to_global(self.scout_A, offset_x, offset_z, "front")
+                            
+                            # DY to różnica między Y nowej rośliny, a Y pierwszej rośliny (zapisanej w [2])
+                            self.grid_dy = abs(g_y - self.scout_A_plant_pos[2])
+                            
+                            print(f"[SUKCES] Wykryto pionowy rozstaw rzędów: DY = {self.grid_dy:.2f} m")
+
+                            self.new_row_start_x = g_x
+                            self.new_row_start_y = g_y
+                            
+                            self.dy_probing_active = False
+                            
+                            break
+                            
+                    # Jeśli widzi roślinę, ale to stara roślina, musi skakać dalej
+                    if self.dy_probing_active:
+                        self.dy_hopping = False
+                        
+                else:
+                    # Kamera zwróciła pustkę - skaczemy dalej!
+                    # print(f"    [CAMERA BLANK] {self.scout_A.name} nie widzi nowego rzędu. Kontynuuję jazdę.")
+                    self.dy_hopping = False
+
+        # --- 3. ZAKOŃCZENIE STANU I SPRZĄTANIE ---
+        if not self.dy_probing_active:
+            print("=" * 60)
+            self.scout_A.stop()
+            self.action_in_progress = False
+            
+            # Sprzątamy zmienne tymczasowe
+            del self.dy_hopping
+            del self.dy_hop_dist
+            del self.dy_probing_active
+            del self.dy_aligned # Sprzątamy nową flagę
+            
+            # Ważne: Przechodzimy do DONE, żeby nie wpaść w pętlę!
+            self.state = "CORRIDOR_SCAN"
+
+            print("\n" + "=" * 50)
+            print("AKTUALNA MAPA AWARYJNA (EMERGENCY MAP)")
+            print("=" * 50)
+            
+            if not self.app.emergency_map:
+                print("  [!] Mapa jest obecnie pusta. Brak danych.")
+            else:
+                # Używamy sorted(), żeby rośliny wyświetlały się po kolei według ID
+                for marker_id, (x, y) in sorted(self.app.emergency_map.items()):
+                    print(f"ID: {marker_id:2d}  |  X: {x:6.2f} m  |  Y: {y:6.2f} m")
+                    
+            print("=" * 50 + "\n")
 
     
+    def _state_corridor_scan(self):
+        """STAN: Prostopadłe (L-kształtne) wyrównanie do korytarza i skokowe skanowanie rzędów w prawo (co DX)."""
+        
+        # --- 1. INICJALIZACJA ---
+        if not hasattr(self, 'scan_phase'):
+            print("\n" + "=" * 60)
+            print("[CORRIDOR SCAN] Rozpoczynam wjazd do korytarza!")
+            print("=" * 60)
+            
+            # 1. Pozycja Y: Dokładnie w połowie między starym a nowym rzędem
+            self.corridor_y = self.new_row_start_y - (self.grid_dy / 2.0)
+            
+            # 2. Pozycja X: Na wprost pierwszej rośliny z nowego rzędu
+            self.current_scan_x = self.new_row_start_x
+            
+            # Zmieniamy fazę startową na jazdę tylko w osi Y
+            self.scan_phase = "ALIGN_Y" 
+            self.scan_hopping = False
+            self.action_in_progress = True
+
+        # --- 2A. FAZA ALIGN_Y: Najpierw jedziemy "w górę" do linii korytarza ---
+        if self.scan_phase == "ALIGN_Y":
+            if not self.scan_hopping:
+                # Zmieniamy TYLKO pozycję Y. X zostaje bez zmian. 
+                # heading=math.pi/2 upewnia się, że łazik patrzy prosto w kierunku jazdy (na Północ)
+                self.scout_A.go_to(self.scout_A.pos[0], self.corridor_y, heading=math.pi/2)
+                self.scan_hopping = True
+                
+            elif self.scout_A.status != "moving":
+                self.scan_phase = "ALIGN_X"
+                self.scan_hopping = False
+
+        # --- 2B. FAZA ALIGN_X: Następnie jedziemy "w prawo" na wprost rośliny ---
+        elif self.scan_phase == "ALIGN_X":
+            if not self.scan_hopping:
+                # Zmieniamy TYLKO pozycję X. Y zostaje z korytarza.
+                # heading=0.0 odwraca łazik na Wschód (w prawo)
+                self.scout_A.go_to(self.current_scan_x, self.corridor_y, heading=0.0)
+                self.scan_hopping = True
+                
+            elif self.scout_A.status != "moving":
+                self.scan_phase = "SCAN_STEP"
+                self.scan_hopping = False
+
+        # --- 3. FAZA SCAN_STEP: Skoki w prawo o wartość DX ---
+        elif self.scan_phase == "SCAN_STEP":
+            if not self.scan_hopping:
+                
+                # A) SKANOWANIE NA POSTOJU (Kamera Lewa i Prawa)
+                for cam in ["left", "right"]:
+                    det = self.read_aruco_from_rover_camera(self.scout_A, camera_name=cam)
+                    if det:
+                        for marker_id, (offset_x, offset_z) in det.items():
+                            if marker_id not in self.app.emergency_map:
+                                g_x, g_y = self._local_to_global(self.scout_A, offset_x, offset_z, cam)
+                                self.app.emergency_map[marker_id] = (g_x, g_y)
+                                print(f"[MAPA] Odkryto roślinę ID: {marker_id:2d} (X: {g_x:.2f}, Y: {g_y:.2f})")
+                
+                # B) DECYZJA O KOLEJNYM SKOKU
+                # Zostawiamy mały margines (0.1), żeby nie skakał poza krawędź x_max
+                if self.current_scan_x >= self.x_max - 0.1:
+                    print("\n[SCAN] Osiągnięto prawą krawędź pola (X_max)! Korytarz zmapowany.")
+                    self.scan_phase = "DONE"
+                else:
+                    # Dodajemy DX i jedziemy wzdłuż korytarza
+                    self.current_scan_x += self.grid_dx
+                    self.scout_A.go_to(self.current_scan_x, self.corridor_y, heading=0.0)
+                    self.scan_hopping = True
+                    
+            elif self.scout_A.status != "moving":
+                # Gdy dojedzie na nową pozycję, zwalniamy flagę - w kolejnym takcie wykona skan!
+                self.scan_hopping = False
+
+        # --- 4. ZAKOŃCZENIE STANU ---
+        elif self.scan_phase == "DONE":
+            self.scout_A.stop()
+            self.action_in_progress = False
+            
+            # Sprzątamy
+            del self.scan_phase
+            del self.scan_hopping
+            del self.corridor_y
+            del self.current_scan_x
+            del self.new_row_start_x
+            del self.new_row_start_y
+            
+            self.state = "DONE"

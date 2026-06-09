@@ -119,47 +119,60 @@ class Rover:
         self._thread.start()
 
         with Rover._class_lock:
+            
+            # Słownik z konfiguracją 3 kamer: (nazwa_aliasu, pozycja_xyz, rotacja_euler)
+            camera_configs = {
+                "front": {
+                    "alias": f"{self.name}_camera",
+                    "pos": [0.75, 0.0, 0.15],
+                    "ori": [0.0, math.pi / 2, math.pi / 2]  # Patrzy prosto
+                },
+                "left": {
+                    "alias": f"{self.name}_camera_left",
+                    "pos": [0.4, 0.65, 0.3],                
+                    "ori": [-math.pi / 2, 0.0, math.pi]     # POPRAWKA: Prawdziwy obrót w LEWO, bez przechyłu!
+                },
+                "right": {
+                    "alias": f"{self.name}_camera_right",
+                    "pos": [0.4, -0.65, 0.3],               
+                    "ori": [math.pi / 2, 0.0, 0.0]          # POPRAWKA: Prawdziwy obrót w PRAWO, bez przechyłu!
+                }
+            }
 
-            # create vision sensor
-            cam = self.sim.createVisionSensor(
-                2,
-                [1024, 1024, 0, 0],
-                [
-                    0.01,                 # near clipping
-                    20.0,                 # far clipping
-                    math.radians(60),     # FOV
-                    0.1,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ]
-            )
+            # Bufor na uchwyty z symulacji
+            handles = {}
 
-            # name
-            self.sim.setObjectAlias(cam, f"{self.name}_camera")
+            for cam_key, config in camera_configs.items():
+                # create vision sensor
+                cam = self.sim.createVisionSensor(
+                    2,
+                    [1024, 1024, 0, 0],
+                    [
+                        0.01,                 # near clipping
+                        20.0,                 # far clipping
+                        math.radians(60),     # FOV
+                        0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                    ]
+                )
 
-            # attach to rover
-            self.sim.setObjectParent(cam, self.handle, True)
+                # name
+                self.sim.setObjectAlias(cam, config["alias"])
 
-            # position relative to rover
-            self.sim.setObjectPosition(
-                cam,
-                self.handle,
-                [0.75, 0.0, 0.15]
-            )
+                # attach to rover
+                self.sim.setObjectParent(cam, self.handle, True)
 
-            # orientation relative to rover
-            self.sim.setObjectOrientation(
-                cam,
-                self.handle,
-                [0.0, math.pi / 2, math.pi / 2]
-            )
+                # position relative to rover
+                self.sim.setObjectPosition(cam, self.handle, config["pos"])
 
-            self.camera = cam
+                # orientation relative to rover
+                self.sim.setObjectOrientation(cam, self.handle, config["ori"])
+
+                handles[cam_key] = cam
+
+            # Przypisanie uchwytów do zmiennych klasy, tak jak oczekuje tego recovery_manager
+            self.camera = handles["front"]
+            self.camera_left = handles["left"]
+            self.camera_right = handles["right"]
 
 
 
