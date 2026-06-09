@@ -1064,6 +1064,9 @@ if __name__ == "__main__":
         plants = detect_plants()
         print(f"Znaleziono {len(plants)} roslin")
 
+        for rv in rovers:
+            rv.all_plants = plants
+
         # root = tk.Tk()
         # NavApp(root, rovers, base_pos, stations, plants)
         # root.mainloop()

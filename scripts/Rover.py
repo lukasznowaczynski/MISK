@@ -24,7 +24,7 @@ class Rover:
     DRAIN_TASK          = 1.00
     # Battery charge (%/s)
     STATION_CHARGE_RATE = 5.0
-    SOLAR_CHARGE_RATE   = 0.10   # panels open, not at station
+    SOLAR_CHARGE_RATE   = 2.50   # panels open, not at station
 
     # Navigation
     ARRIVE_DIST    = 0.8
@@ -98,6 +98,7 @@ class Rover:
 
         # Fleet awareness — set externally after all rovers are created
         self.all_rovers = []
+        self.all_plants = []
 
         # Cached pose
         self.pos     = list(spawn_coords)
@@ -358,7 +359,24 @@ class Rover:
             avoidance_turn -= weight * math.sin(theta) * self.MAX_TURN * 2.0
             if nearest_front is None or dist < nearest_front:
                 nearest_front = dist
-
+        PLANT_WARN = 2.5
+        PLANT_STOP = 1.5
+        for plant in getattr(self, 'all_plants', []):
+            dx = plant.pos[0] - my_x
+            dy = plant.pos[1] - my_y
+            dist = math.hypot(dx, dy)
+            if dist < 0.01 or dist >= PLANT_WARN:
+                continue
+            fwd = dx * cos_h + dy * sin_h
+            if fwd <= 0:
+                continue
+            lat = -dx * sin_h + dy * cos_h
+            theta = math.atan2(lat, fwd)
+            weight = 1.0 - dist / PLANT_WARN
+            avoidance_turn -= weight * math.sin(theta) * self.MAX_TURN * 2.0
+            if nearest_front is None or dist < nearest_front:
+                nearest_front = dist
+                
         if nearest_front is not None and nearest_front < self.STOP_DIST:
             if self.status == "moving":
                 self.status = "blocked"

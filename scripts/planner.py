@@ -375,7 +375,7 @@
 #             )
 #
 #             # 2. Jazda waypointami
-#             for waypoint in path[::5]:
+#             for waypoint in path[::3]:
 #                 if generation != self.reset_generation:
 #                     return
 #                 if rover_info.failed:
