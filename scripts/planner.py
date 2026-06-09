@@ -1433,38 +1433,36 @@ class Planista:
                     RoverState.FAILED,
             ):
                 print(f"[Planista] {rover_info.name} ma niski poziom baterii")
-
                 if rover_info.assigned_field:
                     field = self.fields[rover_info.assigned_field]
                     self.return_task_to_queue(field)
                     rover_info.assigned_field = None
                     rover_info.current_task = None
-
                 self.send_rover_to_charge(rover_info)
                 continue
 
-            # Ładowanie zakończone dopiero przy 95%
-            if rover_info.state == RoverState.CHARGING and rover.battery >= 95:
-                if rover.panels_open:
-                    rover.close_panels()
+            # Ładowanie zakończone — stacja lub panele
+            if rover_info.state == RoverState.CHARGING:
 
-                self.reserved_charging_stations.pop(rover_info.name, None)
-                rover.charging_target = None
-                rover_info.state = RoverState.IDLE
-                print(f"[Planista] {rover_info.name} zakończył ładowanie")
-                continue
+                # Próg zakończenia: stacja = 95%, panele = 50%
+                # (panele ładują 50x wolniej — nie ma sensu czekać do 95%)
+                threshold = 50.0 if rover.panels_open else 95.0
 
-                # Łazik utknął w CHARGING ale bateria nie rośnie — był "dead",
-                # panele naładowały go powyżej 25%, może wrócić do pracy
-            if rover_info.state == RoverState.CHARGING and rover.battery >= 25:
-                if rover.status == "dead":
-                    rover.status = "idle"  # odblokuj wątek sterujący
-                if rover.panels_open and rover.battery >= 50:
-                    rover.close_panels()  # złóż panele dopiero przy 50%
+                if rover.battery >= threshold:
+                    # Odblokuj status "dead" żeby łazik mógł się ruszyć
+                    if rover.status == "dead":
+                        rover.status = "idle"
+
+                    # Złóż panele jeśli były otwarte
+                    if rover.panels_open:
+                        rover.close_panels()
+
+                    # Zwolnij stację i ustaw IDLE
                     self.reserved_charging_stations.pop(rover_info.name, None)
                     rover.charging_target = None
                     rover_info.state = RoverState.IDLE
-                    print(f"[Planista] {rover_info.name} wznowił pracę po ładowaniu panelami")
+                    print(f"[Planista] {rover_info.name} zakończył ładowanie "
+                          f"(bateria: {rover.battery:.0f}%)")
 
     def handle_rover_battery_depleted(self, rover_info):
         rover = rover_info.rover
