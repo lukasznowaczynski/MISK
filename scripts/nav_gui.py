@@ -123,6 +123,16 @@ def setup_environment():
         _sim.setObjectInt32Param(pad, _sim.shapeintparam_static, 1)
         _sim.setObjectInt32Param(pad, _sim.shapeintparam_respondable, 0)
 
+    # ── Base marker (potrzebny dla clockwise routing) ──────────────────────
+    base_h = _sim.createPrimitiveShape(
+        _sim.primitiveshape_cuboid, [1.0, 1.0, 0.5], 0)
+    _sim.setObjectPosition(base_h, -1, [WIATKA_X, WIATKA_Y, 0.25])
+    _sim.setObjectAlias(base_h, 'base_cube')
+    _sim.setShapeColor(base_h, None,
+                       _sim.colorcomponent_ambient_diffuse, [0.15, 0.25, 0.75])
+    _sim.setObjectInt32Param(base_h, _sim.shapeintparam_static, 1)
+    _sim.setObjectInt32Param(base_h, _sim.shapeintparam_respondable, 0)
+
     # ── Rovers ────────────────────────────────────────────────────────────
     rover_jmaps = {}
     if os.path.exists(rover_path):
